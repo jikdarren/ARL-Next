@@ -518,7 +518,8 @@ def telegram_send(msg, bot_token, chat_id):
         "text": msg
     }
     try:
-        conn = http_req(url, method='post', json=payload, timeout=10)
+        # Telegram 请求携带 Bot Token，必须校验服务端证书。
+        conn = http_req(url, method='post', json=payload, timeout=10, verify=True)
         return conn.json()
     except Exception as e:
         logger.warning(f"telegram_send error: {e}")
