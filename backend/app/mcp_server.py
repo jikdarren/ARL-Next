@@ -4,7 +4,7 @@ ARL-Next 原生异步 MCP SSE 服务 (Model Context Protocol 2024-11-05 规范)
 - 异步高并发：基于 Python asyncio 标准库原生实现 HTTP/1.1 与 SSE 长连接，不占用 Web 线程池
 - 协议完整性：支持 GET /sse 建立长连接握手与 POST /message 消息上行
 - 双通道鉴权：支持 Header (Authorization: Bearer / Token) 与 URL Query (?token= / ?api_key=)
-- 渐进式工具集：默认仅暴露只读资产画像与状态查询；环境变量 ARL_MCP_ENABLE_DISPATCH=true 时开启调度写入
+- 渐进式工具集：发现和执行共用全局工具开关与 Key Scope；环境变量仅提供未配置时的默认值
 """
 
 import asyncio
@@ -12,22 +12,25 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import time
 import urllib.parse
+from datetime import date, datetime
+from bson import ObjectId
 from typing import Dict, Optional, Tuple
 
 try:
     from app import utils
     from app.config import Config
-    from app.mcp_asset import build_asset_profile, _clean_empty
+    from app.mcp_asset import build_asset_profile, build_enterprise_profile, _clean_empty
 except ImportError:
     # 允许作为单脚本在不同路径下启动加载
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
     from app import utils
     from app.config import Config
-    from app.mcp_asset import build_asset_profile, _clean_empty
+    from app.mcp_asset import build_asset_profile, build_enterprise_profile, _clean_empty
 
 from app.mcp_security import (
     MCPRequestError, authenticate_mcp_token, authorize_tool,
@@ -44,6 +47,19 @@ logger.setLevel(logging.INFO)
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "arl-next-remote"
 SERVER_VERSION = "2.0.0"
+MAX_SESSIONS = 256
+MAX_PENDING_RPC = 64
+MAX_SESSION_RPC = 16
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+REPLY_QUEUE_TIMEOUT = 5.0
+
+
+def json_value(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, ObjectId):
+        return str(value)
+    raise TypeError(f'Unsupported MCP result type: {type(value).__name__}')
 
 # 工具定义集
 TOOL_GET_ASSET_PROFILE = {
@@ -59,6 +75,41 @@ TOOL_GET_ASSET_PROFILE = {
             "task_id": {
                 "type": "string",
                 "description": "可选。24位任务 ID。若指定则锁定该任务上下文，未指定则智能匹配最新任务或全局资产"
+            }
+        },
+        "required": ["target"]
+    }
+}
+
+TOOL_GET_ENTERPRISE_PROFILE = {
+    "name": "get_enterprise_profile",
+    "description": "获取指定企业标的（企业全称、简称、备案域名如 qq.com 或备案号）的全景生态资产画像与组织架构（包括工商背景、ICP备案网站、移动APP、微信小程序、公众号、企业微博、快应用及投资控股关系）。支持按资产分类下钻分页查询。",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "企业标的，支持企业工商全称（如'深圳市腾讯计算机系统有限公司'）、企业商业简称（如'腾讯'）、根域名（如'qq.com'，自动反查所属企业）或 ICP 备案主体/备案号"
+            },
+            "category": {
+                "type": "string",
+                "enum": ["all", "web", "app", "mapp", "wechat", "weibo", "kapp", "invest"],
+                "default": "all",
+                "description": "查询维度：'all'（默认总览画像与各维度统计指标）；'web'（网站备案域名）；'app'（移动应用）；'mapp'（微信小程序）；'wechat'（微信公众号）；'weibo'（企业微博）；'kapp'（快应用）；'invest'（对外投资与控股子公司）"
+            },
+            "page": {
+                "type": "integer",
+                "default": 1,
+                "description": "下钻指定 category 时的页码（从 1 开始）"
+            },
+            "size": {
+                "type": "integer",
+                "default": 20,
+                "description": "下钻指定 category 时每页记录条数（默认 20，最大 100）"
+            },
+            "task_id": {
+                "type": "string",
+                "description": "可选。24位企业测绘任务 ID。若指定则直接锁定该任务历史数据"
             }
         },
         "required": ["target"]
@@ -106,7 +157,7 @@ TOOL_GET_TASK_STATUS = {
 
 TOOL_CREATE_SCAN_TASK = {
     "name": "create_scan_task",
-    "description": "【受控调度】向 ARL 调度队列提交新的资产扫描任务（需在服务端启用 ARL_MCP_ENABLE_DISPATCH）。",
+    "description": "【受控调度】向 ARL 调度队列提交新的资产扫描任务（需启用工具开关并具备 task:dispatch 权限）。",
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -153,6 +204,8 @@ class MCPSession:
         self.created_at = time.time()
         self.last_active = time.time()
         self.is_closed = False
+        self.pending: set[asyncio.Task] = set()
+        self.pending_count = 0
 
     def touch(self):
         self.last_active = time.time()
@@ -168,13 +221,15 @@ class MCPServer:
         self.port = port
         self.sessions: Dict[str, MCPSession] = {}
         self.server: Optional[asyncio.AbstractServer] = None
+        self.pending: set[asyncio.Task] = set()
+        self.pending_count = 0
         self._dispatch_enabled = os.environ.get("ARL_MCP_ENABLE_DISPATCH", "").strip().lower() in ("true", "1", "yes")
 
     def get_supported_tools(self, user_info=None) -> list:
         policy = load_mcp_policy(self._dispatch_enabled)
         user_info = user_info or {'scopes': ['asset:read', 'task:dispatch']}
         tools = []
-        for tool in (TOOL_GET_ASSET_PROFILE, TOOL_SEARCH_ASSETS, TOOL_GET_TASK_STATUS,
+        for tool in (TOOL_GET_ASSET_PROFILE, TOOL_GET_ENTERPRISE_PROFILE, TOOL_SEARCH_ASSETS, TOOL_GET_TASK_STATUS,
                      TOOL_CREATE_SCAN_TASK, TOOL_STOP_SCAN_TASK):
             try:
                 authorize_tool(user_info, tool['name'], policy)
@@ -212,12 +267,13 @@ class MCPServer:
         start_time = time.time()
         target = str(args.get("target", "") or args.get("query", "") or args.get("task_id", "") or args.get("name", "")).strip()
         result, is_err = {}, False
+        audit_call = True
 
         try:
             policy = await asyncio.to_thread(load_mcp_policy, self._dispatch_enabled)
-            authorize_tool(user_info, name, policy)
             if not quota_checked:
                 await asyncio.to_thread(consume_mcp_quota, user_info, policy)
+            authorize_tool(user_info, name, policy)
             max_search_limit = policy['max_search_limit']
 
             # 3. 具体工具分流执行
@@ -233,8 +289,22 @@ class MCPServer:
                 result = profile
                 return result, is_err
 
+            elif name == "get_enterprise_profile":
+                target_param = str(args.get("target", "")).strip()
+                category = str(args.get("category", "all")).strip()
+                task_id = str(args.get("task_id", "")).strip()
+                page = args.get("page", 1)
+                size = args.get("size", 20)
+                if not target_param and not task_id:
+                    result, is_err = {"status": "error", "message": "Missing required parameter: target"}, True
+                    return result, is_err
+                profile = await asyncio.to_thread(build_enterprise_profile, target_param, category, page, size, task_id)
+                is_err = isinstance(profile, dict) and profile.get("status") in ("auth_error", "error")
+                result = profile
+                return result, is_err
+
             elif name == "search_assets":
-                query = str(args.get("query", "")).strip()
+                query = re.escape(str(args.get("query", "")).strip())
                 asset_type = str(args.get("asset_type", "site")).strip().lower()
                 requested_limit = int(args.get("limit", 10))
                 limit = min(max(requested_limit, 1), max_search_limit)
@@ -244,7 +314,7 @@ class MCPServer:
 
                 def _query_db():
                     coll_name = asset_type if asset_type in ("site", "domain", "ip", "vuln") else "site"
-                    filter_cond = {}
+                    filter_cond: dict[str, object] = {}
                     if coll_name == "site":
                         filter_cond = {"$or": [{"site": {"$regex": query, "$options": "i"}}, {"title": {"$regex": query, "$options": "i"}}]}
                         proj = {"favicon.data": 0, "body": 0, "header": 0}
@@ -348,6 +418,7 @@ class MCPServer:
             result, is_err = {"status": "error", "message": f"Tool '{name}' not found"}, True
             return result, is_err
         except MCPRequestError as e:
+            audit_call = e.audit
             result, is_err = {"status": "denied", "message": str(e), "code": e.status}, True
             return result, is_err
         except Exception as e:
@@ -356,10 +427,12 @@ class MCPServer:
             return result, is_err
         finally:
             duration_ms = int((time.time() - start_time) * 1000)
-            asyncio.create_task(self._record_audit_log(user_info, name, target, args, result, is_err, duration_ms))
+            if audit_call:
+                asyncio.create_task(self._record_audit_log(user_info, name, target, args, result, is_err, duration_ms))
 
-    async def handle_jsonrpc(self, req: dict, session: MCPSession, *, quota_checked=False) -> Optional[dict]:
+    async def handle_jsonrpc(self, req: dict, session: MCPSession, *, quota_checked=False, user_info=None) -> Optional[dict]:
         """处理遵循 JSON-RPC 2.0 规范的 MCP 核心协议报文"""
+        user_info = session.auth_user if user_info is None else user_info
         req_id = req.get("id")
         method = req.get("method", "")
         params = req.get("params", {})
@@ -401,7 +474,7 @@ class MCPServer:
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "tools": await asyncio.to_thread(self.get_supported_tools, session.auth_user)
+                    "tools": await asyncio.to_thread(self.get_supported_tools, user_info)
                 }
             }
 
@@ -409,9 +482,9 @@ class MCPServer:
         if method == "tools/call":
             tool_name = params.get("name", "")
             tool_args = params.get("arguments", {})
-            profile_data, is_err = await self.handle_tool_call(tool_name, tool_args, session.auth_user,
+            profile_data, is_err = await self.handle_tool_call(tool_name, tool_args, user_info,
                                                              quota_checked=quota_checked)
-            compact_json_str = json.dumps(profile_data, ensure_ascii=False, separators=(",", ":"))
+            compact_json_str = json.dumps(profile_data, ensure_ascii=False, separators=(",", ":"), default=json_value)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -453,6 +526,7 @@ class MCPServer:
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """处理 HTTP/1.1 原生长连接与请求路由"""
         peer_name = writer.get_extra_info("peername")
+        reserved_session = None
         try:
             raw_line = await reader.readline()
             if not raw_line:
@@ -491,7 +565,10 @@ class MCPServer:
             session = self.sessions.get(sid)
             if method == 'POST' and path in ('/message', '/mcp/message'):
                 if not session or session.is_closed:
-                    await self._http_error(writer, 401, 'Invalid or expired MCP session')
+                    # Preserve session-expiry responses for authenticated
+                    # clients so they can reconnect without replacing keys.
+                    credential_user = await asyncio.to_thread(self.authenticate_token, token) if token else None
+                    await self._http_error(writer, 404 if credential_user else 401, 'Invalid or expired MCP session')
                     return
                 # A session is bound to its handshake credential. Never fall back
                 # from an explicitly wrong token to a cached privileged identity.
@@ -526,9 +603,12 @@ class MCPServer:
 
             # ==================== 路由 1: GET /sse 或 /mcp/sse (建立 SSE 长连接) ====================
             if method == "GET" and path in ("/sse", "/mcp/sse"):
+                if len(self.sessions) >= MAX_SESSIONS:
+                    await self._http_error(writer, 503, 'MCP session capacity reached', 1)
+                    return
                 session_id = secrets.token_urlsafe(24)
-                session = MCPSession(session_id, auth_user, credential=token)
-                self.sessions[session_id] = session
+                sse_session = MCPSession(session_id, auth_user, credential=token)
+                self.sessions[session_id] = sse_session
                 logger.info(f"SSE Client connected: session={session_id}, user={auth_user.get('username')}, peer={peer_name}")
 
                 # 构造响应头 (严格按照 SSE 规范要求设置长连接与防缓冲)
@@ -552,30 +632,32 @@ class MCPServer:
 
                 # 事件循环：并发分发队列事件与即时断开探测
                 async def _send_events():
-                    while not session.is_closed:
+                    while not sse_session.is_closed:
                         try:
-                            event_data = await asyncio.wait_for(session.queue.get(), timeout=15.0)
+                            event_data = await asyncio.wait_for(sse_session.queue.get(), timeout=15.0)
                             msg_str = json.dumps(event_data, ensure_ascii=False)
                             sse_block = f"event: message\r\ndata: {msg_str}\r\n\r\n"
                             writer.write(sse_block.encode("utf-8"))
                             await writer.drain()
                         except asyncio.TimeoutError:
-                            if not await asyncio.to_thread(self.authenticate_token, session.credential):
-                                session.close()
+                            if sse_session.is_closed:
+                                break
+                            if not await asyncio.to_thread(self.authenticate_token, sse_session.credential):
+                                sse_session.close()
                                 break
                             writer.write(b": keepalive\r\n\r\n")
                             await writer.drain()
 
                 async def _watch_disconnect():
                     try:
-                        while not session.is_closed:
+                        while not sse_session.is_closed:
                             data = await reader.read(1024)
                             if not data:
                                 break
                     except Exception:
                         pass
                     finally:
-                        session.close()
+                        sse_session.close()
 
                 send_task = asyncio.create_task(_send_events())
                 watch_task = asyncio.create_task(_watch_disconnect())
@@ -587,7 +669,7 @@ class MCPServer:
                 except Exception:
                     pass
                 finally:
-                    session.close()
+                    sse_session.close()
                     send_task.cancel()
                     watch_task.cancel()
                     self.sessions.pop(session_id, None)
@@ -624,8 +706,19 @@ class MCPServer:
                     return
 
                 # 读取 Body
-                content_len = int(headers.get("content-length", 0))
-                body_bytes = await reader.readexactly(content_len) if content_len > 0 else b""
+                try:
+                    content_len = int(headers.get('content-length', 0))
+                except ValueError:
+                    await self._http_error(writer, 400, 'Invalid Content-Length')
+                    return
+                if content_len <= 0 or content_len > MAX_MESSAGE_BYTES:
+                    await self._http_error(writer, 400, 'Invalid MCP message size')
+                    return
+                try:
+                    body_bytes = await asyncio.wait_for(reader.readexactly(content_len), timeout=30)
+                except (asyncio.TimeoutError, asyncio.IncompleteReadError):
+                    await self._http_error(writer, 400, 'Incomplete MCP message')
+                    return
                 try:
                     req_json = json.loads(body_bytes.decode("utf-8"))
                 except Exception as e:
@@ -641,23 +734,58 @@ class MCPServer:
                             and not isinstance(req_json.get('params', {}).get('arguments', {}), dict))):
                     await self._http_error(writer, 400, 'Invalid JSON-RPC request')
                     return
+                if self.pending_count >= MAX_PENDING_RPC or session.pending_count >= MAX_SESSION_RPC:
+                    await self._http_error(writer, 429, 'MCP requests are still processing', 1)
+                    return
+                # Reserve synchronously before quota/database awaits; otherwise
+                # concurrent posts can all observe spare capacity at once.
+                self.pending_count += 1
+                session.pending_count += 1
+                reserved_session = session
                 quota_checked = False
                 if req_json.get('method') == 'tools/call':
                     tool_name = req_json.get('params', {}).get('name', '')
                     try:
                         policy = await asyncio.to_thread(load_mcp_policy, self._dispatch_enabled)
-                        authorize_tool(auth_user, tool_name, policy)
                         await asyncio.to_thread(consume_mcp_quota, auth_user, policy)
+                        authorize_tool(auth_user, tool_name, policy)
                         quota_checked = True
                     except MCPRequestError as error:
                         arguments = req_json.get('params', {}).get('arguments', {})
                         target = str(arguments.get('target') or arguments.get('query') or arguments.get('task_id') or '')
-                        await self._record_audit_log(auth_user, tool_name, target, arguments,
-                            {'status': 'denied', 'message': str(error)}, True, 0)
+                        if error.audit:
+                            await self._record_audit_log(auth_user, tool_name, target, arguments,
+                                {'status': 'denied', 'message': str(error)}, True, 0)
                         await self._http_error(writer, error.status, str(error), error.retry_after)
                         return
 
                 session.touch()
+                # 异步处理 JSON-RPC 逻辑并将结果推入该 session 的下行队列
+                async def _dispatch_rpc():
+                    try:
+                        res = await self.handle_jsonrpc(req_json, session, quota_checked=quota_checked, user_info=auth_user)
+                    except Exception:
+                        logger.exception('MCP request processing failed')
+                        res = {'jsonrpc': '2.0', 'id': req_json.get('id'),
+                               'error': {'code': -32603, 'message': 'MCP request processing failed'}}
+                    if res is not None and not session.is_closed:
+                        try:
+                            await asyncio.wait_for(session.queue.put(res), timeout=REPLY_QUEUE_TIMEOUT)
+                        except asyncio.TimeoutError:
+                            session.close()
+
+                # Keep running work counted after disconnect: to_thread work
+                # cannot be stopped by cancelling its asyncio waiter.
+                pending = asyncio.create_task(_dispatch_rpc())
+                self.pending.add(pending)
+                session.pending.add(pending)
+                def finished(task):
+                    self.pending.discard(task)
+                    session.pending.discard(task)
+                    self.pending_count -= 1
+                    session.pending_count -= 1
+                pending.add_done_callback(finished)
+                reserved_session = None
                 # 立即向客户端返回 202 Accepted 确认投递
                 resp_ack = b"HTTP/1.1 202 Accepted\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 8\r\n\r\nAccepted"
                 writer.write(resp_ack)
@@ -665,18 +793,6 @@ class MCPServer:
                 writer.close()
                 await writer.wait_closed()
 
-                # 异步处理 JSON-RPC 逻辑并将结果推入该 session 的下行队列
-                async def _dispatch_rpc():
-                    try:
-                        res = await self.handle_jsonrpc(req_json, session, quota_checked=quota_checked)
-                    except Exception:
-                        logger.exception('MCP request processing failed')
-                        res = {'jsonrpc': '2.0', 'id': req_json.get('id'),
-                               'error': {'code': -32603, 'message': 'MCP request processing failed'}}
-                    if res is not None:
-                        await session.queue.put(res)
-
-                asyncio.create_task(_dispatch_rpc())
                 return
 
             # 未识别路由
@@ -692,6 +808,10 @@ class MCPServer:
                 await writer.wait_closed()
             except Exception:
                 pass
+        finally:
+            if reserved_session is not None:
+                self.pending_count -= 1
+                reserved_session.pending_count -= 1
 
     async def start(self):
         """启动异步监听"""

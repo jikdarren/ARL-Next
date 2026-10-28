@@ -1,4 +1,5 @@
 export default {
+  "mcpToolDescEnterprise": "查询企业生态资产总览及分类型明细",
   "mcpFullKeyPlaceholder": "请输入完整的 MCP API Key",
   "mcpFullKeyHint": "密钥仅保存在当前页面内存中。已有密钥请粘贴创建时保存的完整值。",
   "mcpFullKeyRequired": "请先填写完整有效的 MCP API Key，再复制配置或下载脚本",
@@ -1192,7 +1193,7 @@ export default {
   "backupRestoreTitle": "⚠️ 确认执行系统数据全量覆盖恢复",
   "backupRestoreConfirm": "确认覆盖恢复",
   "backupDropWarning": "极高危操作：系统将执行 --drop 完全覆盖导入！",
-  "backupDropDescription": "恢复过程将清空当前目标数据库中所有集合的数据，并写入备份包中的数据，使其与备份时的状态 100% 保持一致。当前未保存的临时数据将被清除！",
+  "backupDropDescription": "恢复过程将清空当前目标数据库中所有集合的数据，并写入备份包中的数据，使其与备份时的状态 100% 保持一致。当前未保存的临时数据将被清除！ 请在维护窗口暂停外部写入和计划调度；企业测绘任务未结束时禁止恢复。",
   "backupRestoreArchive": "待恢复归档",
   "backupArchiveSize": "归档体积",
   "backupIncludesScreenshots": "包含截图",

@@ -419,3 +419,347 @@ def build_asset_profile(target: str, task_id: str = ""):
         }
 
     return clean_profile
+
+
+def build_enterprise_profile(target: str, category: str = "all", page: int = 1, size: int = 20, task_id: str = "") -> dict:
+    """企业生态资产画像聚合器：自适应识别企业标的、关联资产组态势，并提供总览与分维度下钻"""
+    target = (target or "").strip()
+    task_id = (task_id or "").strip()
+    category = (category or "all").strip().lower()
+
+    allowed_categories = {"all", "web", "app", "mapp", "wechat", "weibo", "kapp", "invest"}
+    if category not in allowed_categories:
+        return {"code": 400, "status": "error", "message": f"Unsupported category '{category}'. Allowed: {sorted(list(allowed_categories))}"}
+
+    try:
+        page = min(2_147_483_647, max(1, int(page or 1)))
+    except (ValueError, TypeError, OverflowError):
+        page = 1
+
+    try:
+        size = min(max(1, int(size or 20)), 100)
+    except (ValueError, TypeError, OverflowError):
+        size = 20
+
+    if not target and not task_id:
+        return {"code": 400, "status": "error", "message": "Target parameter is required"}
+
+    # 1. 任务/标的解析与定位
+    task_doc = None
+    if task_id:
+        if not ObjectId.is_valid(task_id):
+            return {'code': 400, 'status': 'error', 'message': 'Invalid enterprise task_id'}
+        task_doc = utils.conn_db('icp_task').find_one({'_id': ObjectId(task_id)})
+        if not task_doc:
+            return {'status': 'not_found', 'task_id': task_id, 'message': 'Enterprise task not found'}
+
+    if not task_doc:
+        # 1a. 检查 target 是否为域名/URL（如 qq.com，自动反查归属企业主体）
+        hostname = None
+        if "://" in target or target.startswith(("http:", "https:")):
+            parsed = urlparse(target)
+            hostname = (parsed.hostname or "").strip("[]").lower()
+        elif "." in target and not re.search(r'[\u4e00-\u9fa5\s]', target):
+            hostname = target.split("/")[0].split(":")[0].strip().lower()
+
+        if hostname:
+            base_domain = hostname[4:] if hostname.startswith("www.") else hostname
+            domain_query = {
+                "query_type": "web",
+                "$or": [{"domain": hostname}, {"domain": base_domain}, {"ym": hostname}, {"ym": base_domain}]
+            }
+            domain_doc = utils.conn_db('icp_asset').find_one(domain_query, sort=[("_id", -1)])
+            if domain_doc:
+                ent_name = domain_doc.get("companyName") or domain_doc.get("unitName")
+                if ent_name:
+                    target = ent_name
+                if not task_doc and domain_doc.get("task_id"):
+                    try:
+                        task_doc = utils.conn_db('icp_task').find_one({"_id": ObjectId(domain_doc["task_id"])})
+                    except Exception:
+                        pass
+
+        # 1b. 在 icp_task 中检索（优先精确匹配）
+        if not task_doc:
+            exact_query = {
+                "$or": [
+                    {"company_name": target},
+                    {"target": target},
+                    {"name": target}
+                ]
+            }
+            task_doc = utils.conn_db('icp_task').find_one(exact_query, sort=[("_id", -1)])
+
+        # 1c. 模糊检索与多候选识别
+        if not task_doc:
+            reg = {"$regex": re.escape(target), "$options": "i"}
+            candidate_tasks = list(utils.conn_db('icp_task').find({
+                "$or": [
+                    {"company_name": reg},
+                    {"name": reg},
+                    {"target": reg}
+                ]
+            }).sort("_id", -1).limit(10))
+
+            if len(candidate_tasks) == 1:
+                task_doc = candidate_tasks[0]
+            elif len(candidate_tasks) > 1:
+                # 按企业名称去重
+                distinct_tasks = {}
+                for t in candidate_tasks:
+                    c_name = (t.get("company_name") or t.get("target") or t.get("name") or "").strip()
+                    if c_name and c_name not in distinct_tasks:
+                        distinct_tasks[c_name] = t
+                if len(distinct_tasks) == 1:
+                    task_doc = list(distinct_tasks.values())[0]
+                else:
+                    candidates = []
+                    for c_name, t in distinct_tasks.items():
+                        t_id = str(t["_id"])
+                        cnt = utils.conn_db('icp_asset').count_documents({"task_id": t_id})
+                        candidates.append({
+                            "name": c_name,
+                            "task_id": t_id,
+                            "asset_count": cnt,
+                            "task_status": t.get("status", "done")
+                        })
+                    return {
+                        "status": "multiple_candidates",
+                        "target": target,
+                        "tip": "检索到多家匹配的企业，请在下一次调用中使用更精确的企业全称或传入具体的 task_id",
+                        "candidates": candidates
+                    }
+
+        # 1d. 在 asset_scope 中检索企业绑定信息
+        if not task_doc:
+            reg = {"$regex": re.escape(target), "$options": "i"}
+            scope_doc = utils.conn_db('asset_scope').find_one({
+                "$or": [
+                    {"enterprise_name": reg},
+                    {"name": reg}
+                ]
+            }, sort=[("_id", -1)])
+            if scope_doc and scope_doc.get("synced_icp_task_id"):
+                try:
+                    task_doc = utils.conn_db('icp_task').find_one({"_id": ObjectId(scope_doc["synced_icp_task_id"])})
+                except Exception:
+                    pass
+
+        # 1e. 在 icp_asset 中直接检索归属记录
+        if not task_doc:
+            reg = {"$regex": re.escape(target), "$options": "i"}
+            sample_asset = utils.conn_db('icp_asset').find_one({
+                "$or": [{"companyName": reg}, {"unitName": reg}]
+            }, sort=[("_id", -1)])
+            if sample_asset and sample_asset.get("task_id"):
+                try:
+                    task_doc = utils.conn_db('icp_task').find_one({"_id": ObjectId(sample_asset["task_id"])})
+                except Exception:
+                    pass
+
+    # 依然未检索到企业数据 -> 明确返回只读 not_found 与操作指引
+    if not task_doc:
+        return {
+            "status": "not_found",
+            "target": target,
+            "message": f"未在 ARL 资产库中检索到与【{target}】匹配的企业测绘记录",
+            "suggestion": "可前往 ARL Web 控制台【资产分组 -> 企业生态资产 -> 新建企业测绘】，或确认名称/域名无误后重试"
+        }
+
+    resolved_task_id = str(task_doc["_id"])
+    company_name = task_doc.get("company_name") or task_doc.get("target") or task_doc.get("name") or target
+
+    # 2. 查询绑定的资产组网络暴露面态势 (ASM 协同)
+    bound_scope_info = None
+    synced_scope_id = task_doc.get("synced_scope_id")
+    scope_record = None
+    if synced_scope_id and len(str(synced_scope_id)) == 24:
+        try:
+            scope_record = utils.conn_db('asset_scope').find_one({"_id": ObjectId(synced_scope_id)})
+        except Exception:
+            pass
+
+    if not scope_record:
+        scope_record = utils.conn_db('asset_scope').find_one({
+            "$or": [
+                {"synced_icp_task_id": resolved_task_id},
+                {"enterprise_name": company_name}
+            ]
+        })
+
+    if scope_record:
+        s_id = str(scope_record["_id"])
+        domain_arr = scope_record.get("domain_array") or scope_record.get("scope_array") or []
+        managed_domains = len(domain_arr) if isinstance(domain_arr, list) else 0
+        live_sites = utils.conn_db('asset_site').count_documents({"scope_id": s_id})
+        vulns_cnt = utils.conn_db('asset_vuln').count_documents({"scope_id": s_id}) + utils.conn_db('asset_nuclei_result').count_documents({"scope_id": s_id})
+        bound_scope_info = {
+            "scope_id": s_id,
+            "scope_name": scope_record.get("name", ""),
+            "managed_domains": managed_domains,
+            "live_sites": live_sites,
+            "unresolved_risks": vulns_cnt
+        }
+
+    # 3. 总览模式 (category == "all")
+    if category == "all":
+        categories_list = ["web", "app", "mapp", "wechat", "weibo", "kapp", "invest"]
+        counts = {}
+        for cat in categories_list:
+            counts[cat] = utils.conn_db('icp_asset').count_documents({"task_id": resolved_task_id, "query_type": cat})
+        counts["total"] = sum(counts.values())
+
+        # 采集高频核心样本 Top 3~5
+        samples = {}
+        web_docs = list(utils.conn_db('icp_asset').find({"task_id": resolved_task_id, "query_type": "web"}).limit(5))
+        if web_docs:
+            samples["web_top"] = [
+                {
+                    "domain": d.get("domain") or d.get("ym"),
+                    "service_name": d.get("serviceName") or d.get("webName"),
+                    "licence": d.get("serviceLicence") or d.get("liscense")
+                }
+                for d in web_docs
+            ]
+
+        app_docs = list(utils.conn_db('icp_asset').find({"task_id": resolved_task_id, "query_type": "app"}).limit(3))
+        if app_docs:
+            samples["app_top"] = [
+                {
+                    "name": d.get("name") or d.get("serviceName"),
+                    "category": d.get("category")
+                }
+                for d in app_docs
+            ]
+
+        mapp_docs = list(utils.conn_db('icp_asset').find({"task_id": resolved_task_id, "query_type": "mapp"}).limit(3))
+        if mapp_docs:
+            samples["mapp_top"] = [
+                {
+                    "name": d.get("name") or d.get("serviceName"),
+                    "unit_name": d.get("unitName") or d.get("companyName")
+                }
+                for d in mapp_docs
+            ]
+
+        wechat_docs = list(utils.conn_db('icp_asset').find({"task_id": resolved_task_id, "query_type": "wechat"}).limit(3))
+        if wechat_docs:
+            samples["wechat_top"] = [
+                {
+                    "name": d.get("name") or d.get("title"),
+                    "wechat_id": d.get("wechatId") or d.get("publicNum")
+                }
+                for d in wechat_docs
+            ]
+
+        invest_docs = list(utils.conn_db('icp_asset').find({"task_id": resolved_task_id, "query_type": "invest"}).limit(5))
+        if invest_docs:
+            samples["invest_top"] = [
+                {
+                    "company_name": d.get("name") or d.get("companyName"),
+                    "ratio": d.get("percent") or d.get("ratio"),
+                    "legal_person": d.get("legalPerson") or d.get("legalPersonName")
+                }
+                for d in invest_docs
+            ]
+
+        ent_info = {
+            "name": company_name,
+            "task_id": resolved_task_id,
+            "task_status": task_doc.get("status", "done"),
+            "task_type": task_doc.get("task_type", "icp"),
+            "gid": task_doc.get("gid", ""),
+            "bound_scope": bound_scope_info
+        }
+
+        overview = {
+            "status": "success",
+            "enterprise_info": ent_info,
+            "asset_counts": counts,
+            "samples": samples,
+            "drilldown_guidance": {
+                "tip": f"当前为【{company_name}】全景生态资产总览画像。若需查看某维度的完整资产列表，请传入对应 category 参数下钻查询（例如 category='web' 查询全量备案域名；category='invest' 查询子公司架构）；若需对特定域名探查开放端口与漏洞风险，请调用 get_asset_profile(target='xxx.com')。"
+            }
+        }
+        return _clean_empty(overview)
+
+    # 4. 维度明细下钻模式 (category in ["web", "app", "mapp", "wechat", "weibo", "kapp", "invest"])
+    query_cond = {"task_id": resolved_task_id, "query_type": category}
+    total = utils.conn_db('icp_asset').count_documents(query_cond)
+    skip = (page - 1) * size
+    cursor = utils.conn_db('icp_asset').find(query_cond).skip(skip).limit(size)
+
+    items = []
+    for raw in cursor:
+        item = {}
+        if category == "web":
+            item = {
+                "domain": raw.get("domain") or raw.get("ym", ""),
+                "service_name": raw.get("serviceName") or raw.get("webName") or raw.get("name", ""),
+                "service_licence": raw.get("serviceLicence") or raw.get("liscense", ""),
+                "unit_name": raw.get("unitName") or raw.get("companyName", ""),
+                "update_time": raw.get("updateRecordTime") or raw.get("examineDate", ""),
+                "home_url": raw.get("homeUrl", "")
+            }
+        elif category == "app":
+            item = {
+                "name": raw.get("name") or raw.get("serviceName", ""),
+                "category": raw.get("category", ""),
+                "service_licence": raw.get("serviceLicence") or raw.get("liscense", ""),
+                "unit_name": raw.get("unitName") or raw.get("companyName", ""),
+                "brief": raw.get("brief", "")
+            }
+        elif category == "mapp":
+            item = {
+                "name": raw.get("name") or raw.get("serviceName", ""),
+                "category": raw.get("category", ""),
+                "unit_name": raw.get("unitName") or raw.get("companyName", ""),
+                "service_licence": raw.get("serviceLicence") or raw.get("liscense", "")
+            }
+        elif category == "wechat":
+            item = {
+                "name": raw.get("name") or raw.get("title", ""),
+                "wechat_id": raw.get("wechatId") or raw.get("publicNum", ""),
+                "unit_name": raw.get("unitName") or raw.get("companyName", ""),
+                "brief": raw.get("brief", "")
+            }
+        elif category == "weibo":
+            item = {
+                "name": raw.get("name", ""),
+                "home_url": raw.get("homeUrl", ""),
+                "brief": raw.get("brief", "")
+            }
+        elif category == "kapp":
+            item = {
+                "name": raw.get("name", ""),
+                "unit_name": raw.get("unitName") or raw.get("companyName", ""),
+                "service_licence": raw.get("serviceLicence", ""),
+                "category": raw.get("category", "")
+            }
+        elif category == "invest":
+            item = {
+                "company_name": raw.get("name") or raw.get("companyName", ""),
+                "ratio": raw.get("percent") or raw.get("ratio", ""),
+                "legal_person": raw.get("legalPerson") or raw.get("legalPersonName", ""),
+                "reg_status": raw.get("regStatus") or raw.get("status", ""),
+                "reg_capital": raw.get("amount") or raw.get("regCapital", "")
+            }
+        cleaned_item = _clean_empty(item)
+        if cleaned_item:
+            items.append(cleaned_item)
+
+    detail_result = {
+        "status": "success",
+        "enterprise_name": company_name,
+        "task_id": resolved_task_id,
+        "category": category,
+        "pagination": {
+            "page": page,
+            "size": size,
+            "total": total,
+            "has_more": skip + len(items) < total
+        },
+        "items": items,
+        "tip": f"已返回第 {page} 页数据（共 {total} 条）。若需探测特定资产技术暴露面，可调用 get_asset_profile(target='...')"
+    }
+    return _clean_empty(detail_result)

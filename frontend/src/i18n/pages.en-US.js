@@ -1,4 +1,5 @@
 export default {
+  "mcpToolDescEnterprise": "Read enterprise asset overviews and category details",
   "mcpFullKeyPlaceholder": "Paste the complete MCP API key",
   "mcpFullKeyHint": "The key stays in this page only. For an existing key, paste the full value saved when it was created.",
   "mcpFullKeyRequired": "Enter a complete MCP API key before copying the configuration or downloading the script",
@@ -1192,7 +1193,7 @@ export default {
   "backupRestoreTitle": "⚠️ Confirm full system data replacement",
   "backupRestoreConfirm": "Replace data and restore",
   "backupDropWarning": "Destructive operation: --drop will replace all database data!",
-  "backupDropDescription": "Restoring clears all collections in the target database and imports the archive to reproduce its saved state. Current unsaved temporary data will be lost!",
+  "backupDropDescription": "Restoring clears all collections in the target database and imports the archive to reproduce its saved state. Current unsaved temporary data will be lost! Use a maintenance window and pause external writes and scheduled submissions. Restoration is blocked while enterprise recon tasks are unfinished.",
   "backupRestoreArchive": "Archive to restore",
   "backupArchiveSize": "Archive size",
   "backupIncludesScreenshots": "Includes screenshots",

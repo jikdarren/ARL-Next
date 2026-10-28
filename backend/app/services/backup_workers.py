@@ -6,10 +6,42 @@ import time
 
 from app import utils
 
-
 RESTORE_LOCK = '/tmp/arl_restore.lock'
 SCAN_QUEUES = frozenset(('arltask', 'arltask_heavy', 'arltask_light', 'arlgithub'))
 TERMINAL = ('done', 'error', 'stop')
+
+
+class BackupOperationLock:
+    """One backup or restore across threads, web workers and CLI processes."""
+    def __init__(self, path: str):
+        self.path = path
+        self.fd: int | None = None
+
+    def acquire(self):
+        if self.fd is not None:
+            return self
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise RuntimeError('已有备份或恢复正在执行') from None
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd = fd
+        return self
+
+    def release(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc):
+        self.release()
 
 
 class RestoreWorkers:
@@ -19,9 +51,9 @@ class RestoreWorkers:
         self.control = celery.control
         self.force = force
         self.timeout = timeout
-        self.paused = []
-        self.workers = []
-        self.lock_fd = None
+        self.paused: list[tuple[str, str]] = []
+        self.workers: list[str] = []
+        self.lock_fd: int | None = None
         self.restore_started = False
 
     def _acknowledged(self, replies, workers):
@@ -30,27 +62,51 @@ class RestoreWorkers:
         if not set(workers).issubset(acknowledged):
             raise RuntimeError('未收到全部 Worker 的确认，已阻止数据库恢复')
 
-    def _snapshot(self, method):
+    def _responses(self, method):
         replies = getattr(self.control.inspect(destination=self.workers, timeout=3), method)()
         if not isinstance(replies, dict) or not set(self.workers).issubset(replies):
             raise RuntimeError('无法确认全部 Worker 的运行状态，已阻止数据库恢复')
+        return replies
+
+    def _snapshot(self, method):
+        replies = self._responses(method)
         return [task for worker in self.workers for task in replies[worker]]
 
     def _queue_operation(self, purge=False):
-        count = 0
-        with self.app.connection_for_write() as connection:
-            channel = connection.default_channel
-            for queue in sorted({queue for _, queue in self.paused}):
+        count, consumers = 0, 0
+        # Probe every ARL queue, including consumers that did not answer inspect.
+        for queue in sorted(SCAN_QUEUES):
+            with self.app.connection_for_write() as connection:
+                channel = connection.default_channel
+                try:
+                    _, ready, consuming = channel.queue_declare(queue=queue, passive=True)
+                except Exception as exc:
+                    if getattr(exc, 'reply_code', None) == 404 and queue not in {q for _, q in self.paused}:
+                        continue  # A disabled queue may never have been declared.
+                    raise
+                if not isinstance(ready, int) or not isinstance(consuming, int):
+                    raise RuntimeError('无法确认消息队列状态，已阻止恢复')  # noqa: TRY004 -- malformed broker reply, not caller input
+                count += ready
+                consumers += consuming
                 if purge:
+                    if consuming:
+                        raise RuntimeError('扫描队列仍有消费者，禁止清理消息或恢复')
                     channel.queue_purge(queue=queue)
-                else:
-                    count += channel.queue_declare(queue=queue, passive=True)[1]
-        return count
+        return count, consumers
+
+    def _pool_processes(self):
+        stats = self._responses('stats')
+        result = {}
+        for worker in self.workers:
+            processes = stats[worker].get('pool', {}).get('processes')
+            if not isinstance(processes, list) or any(type(pid) is not int for pid in processes):
+                raise RuntimeError('恢复需要可确认子进程退出的 prefork Worker')
+            result[worker] = set(processes)
+        return result
 
     def _unfinished(self):
         for name in ('task', 'github_task'):
-            for task in utils.conn_db(name).find({'status': {'$nin': list(TERMINAL)}}, {'celery_id': 1}):
-                yield task
+            yield from utils.conn_db(name).find({'status': {'$nin': list(TERMINAL)}}, {'celery_id': 1})
 
     def _mark_stopped(self):
         for name in ('task', 'github_task'):
@@ -65,7 +121,7 @@ class RestoreWorkers:
             try:
                 self._acknowledged(self.control.add_consumer(
                     queue, destination=[worker], reply=True, timeout=3), [worker])
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 -- attempt to resume every paused queue
                 failures.append(exc)
         self.paused.clear()
         if failures:
@@ -79,6 +135,9 @@ class RestoreWorkers:
     def __enter__(self):
         self.lock_fd = os.open(RESTORE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
         try:
+            if utils.conn_db('icp_task').count_documents({'status': {'$nin': list(TERMINAL)}}):
+                raise RuntimeError('企业测绘任务未完成；请先等待 OSINT 任务结束，不能强制覆盖恢复')
+            deadline = time.monotonic() + self.timeout
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             self._unlock()
@@ -101,13 +160,36 @@ class RestoreWorkers:
             if not self.workers:
                 raise RuntimeError('未找到可确认状态的扫描 Worker，已阻止数据库恢复')
 
+            queued, consumers = self._queue_operation()
+            while consumers:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('队列消费未完全暂停或存在未响应的 Worker，已阻止恢复')
+                time.sleep(0.2)
+                queued, consumers = self._queue_operation()
+
             active = self._snapshot('active')
             reserved = self._snapshot('reserved')
             scheduled = self._snapshot('scheduled')
             unfinished = list(self._unfinished())
-            queued = self._queue_operation()
             if (active or reserved or scheduled or unfinished or queued) and not self.force:
                 raise RuntimeError('存在运行中或排队中的任务，请等待完成或确认强制恢复')
+
+            # A prefetched request can still enter a pool child. Let these
+            # settle before identifying the processes that must actually exit.
+            while reserved:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('预取任务尚未进入可确认状态，已阻止恢复')
+                time.sleep(0.2)
+                reserved = self._snapshot('reserved')
+            active_by_worker = self._responses('active')
+            active = [task for worker in self.workers for task in active_by_worker[worker]]
+            old_processes = self._pool_processes() if active else {}
+            active_pids = {worker: {task.get('worker_pid') for task in active_by_worker[worker]}
+                           for worker in self.workers}
+            for worker, pids in active_pids.items():
+                if pids and (any(type(pid) is not int for pid in pids)
+                             or not pids.issubset(old_processes.get(worker, set()))):
+                    raise RuntimeError('无法确认运行任务所属子进程，已阻止恢复')
 
             task_ids = {task['id'] for task in active + reserved if task.get('id')}
             task_ids.update(task['request']['id'] for task in scheduled if task.get('request', {}).get('id'))
@@ -116,10 +198,16 @@ class RestoreWorkers:
                 self._acknowledged(self.control.revoke(
                     sorted(task_ids), terminate=True, signal='SIGTERM',
                     destination=self.workers, reply=True, timeout=3), self.workers)
-            deadline = time.monotonic() + self.timeout
-            while self._snapshot('active'):
+            while True:
+                remaining = self._snapshot('active')
+                current = self._pool_processes() if active else {}
+                # revoke removes requests from inspect.active before SIGTERM
+                # has finished. Require the original pool children to be reaped.
+                alive = any(active_pids[worker] & pids for worker, pids in current.items())
+                if not remaining and not alive:
+                    break
                 if time.monotonic() >= deadline:
-                    raise RuntimeError('等待 Worker 停止超时，已阻止数据库恢复')
+                    raise RuntimeError('等待 Worker 子进程退出超时，已阻止数据库恢复')
                 time.sleep(0.2)
             if self.force:
                 self._queue_operation(purge=True)

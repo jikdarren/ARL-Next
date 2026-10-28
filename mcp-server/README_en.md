@@ -122,13 +122,14 @@ claude mcp add -s user arl-next \
 
 ## <span id="tools"></span>🧩 Core Capabilities & Agent Interactions
 
-ARL-Next MCP registers 5 standardized tools with read-only reconnaissance enabled by default and controlled task dispatching:
+ARL-Next MCP registers 6 standardized tools with read-only reconnaissance enabled by default and controlled task dispatching:
 
 ### 1. Tool Matrix
 
 | Tool Name | Core Purpose | Default Access | Typical Application |
 | :--- | :--- | :--- | :--- |
 | `get_asset_profile` | 5-Dimensional Asset Profile | **Read-Only (Open)** | Query ports, services, Web fingerprints, TLS certs, historical vulnerabilities, and file leaks |
+| `get_enterprise_profile` | Enterprise Ecosystem Profile | **Read-Only (Open)** | Query corporate structure, ICP domains, mobile apps, mini programs, official accounts, Weibo, and investments |
 | `search_assets` | Full-Database Search | **Read-Only (Open)** | Search sites, domains, IPs, or vulnerabilities by keyword |
 | `get_task_status` | Task Status Tracking | **Read-Only (Open)** | Inspect real-time progress percentages and metric summaries of a 24-character task ID |
 | `create_scan_task` | Submit Scan Task | **Guarded (Requires Auth)** | Trigger ARL regular reconnaissance or periodic risk-cruising tasks |
@@ -141,10 +142,13 @@ Once connected, interact with your AI Agent using natural language:
 - **Scenario 1: Single Target Attack Surface Drill-Down**
   > **💬 Prompt**: "Analyze the network exposure and known vulnerabilities of `target.example.com`."<br>
   > **🤖 Agent Action**: Invokes `get_asset_profile(target="target.example.com")` to gather open ports, tech fingerprints, SSL certificates, and CVE findings in a single request, presenting a structured security summary.
-- **Scenario 2: Component & Tech Stack Reconnaissance**
+- **Scenario 2: Enterprise Ecosystem Reconnaissance & ASM Correlation**
+  > **💬 Prompt**: "Find out what mobile apps and mini programs Xiaomi operates, and list its primary ICP domains."<br>
+  > **🤖 Agent Action**: Invokes `get_enterprise_profile(target="Xiaomi")` to retrieve an overview profile and top asset samples, drills down with `get_enterprise_profile(target="Xiaomi", category="app")` as needed, and evaluates exposure risks via `get_asset_profile` on core domains.
+- **Scenario 3: Component & Tech Stack Reconnaissance**
   > **💬 Prompt**: "Search our database for all site assets running Spring Boot or Nginx."<br>
   > **🤖 Agent Action**: Invokes `search_assets(query="Spring Boot", asset_type="site")` and returns matching endpoints, IP mappings, and associated scan jobs.
-- **Scenario 3: Controlled Task Dispatch & Status Monitoring**
+- **Scenario 4: Controlled Task Dispatch & Status Monitoring**
   > **💬 Prompt**: "Launch a reconnaissance task against IP `192.0.2.1` and summarize the results when done."<br>
   > **🤖 Agent Action**: Invokes `create_scan_task(target="192.0.2.1")`, monitors progress via `get_task_status(task_id="...")`, and notifies upon completion.
 

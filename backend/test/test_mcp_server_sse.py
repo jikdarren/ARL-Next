@@ -39,6 +39,7 @@ class TestMCPServerSSE(unittest.IsolatedAsyncioTestCase):
             tools = srv.get_supported_tools()
             tool_names = [t["name"] for t in tools]
             self.assertIn("get_asset_profile", tool_names)
+            self.assertIn("get_enterprise_profile", tool_names)
             self.assertIn("search_assets", tool_names)
             self.assertIn("get_task_status", tool_names)
             self.assertNotIn("create_scan_task", tool_names)
@@ -51,6 +52,7 @@ class TestMCPServerSSE(unittest.IsolatedAsyncioTestCase):
             tools = srv.get_supported_tools()
             tool_names = [t["name"] for t in tools]
             self.assertIn("get_asset_profile", tool_names)
+            self.assertIn("get_enterprise_profile", tool_names)
             self.assertIn("create_scan_task", tool_names)
             self.assertIn("stop_scan_task", tool_names)
 
@@ -323,6 +325,27 @@ class TestMCPServerSSE(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_err)
         self.assertEqual(res.get("status"), "denied")
         self.assertIn("Permission denied", res.get("message", ""))
+
+    async def test_tool_call_get_enterprise_profile(self):
+        """测试通过 SSE MCP 服务分流调用 get_enterprise_profile 工具"""
+        readonly_user = {
+            "username": "auditor",
+            "type": "mcp_key",
+            "scopes": ["asset:read"],
+            "key_id": "507f1f77bcf86cd799439011",
+            "key_name": "Readonly Key"
+        }
+        with patch("app.mcp_server.build_enterprise_profile") as mock_build:
+            mock_build.return_value = {
+                "status": "success",
+                "enterprise_info": {"name": "腾讯计算机", "task_id": "670000000000000000000001"},
+                "asset_counts": {"web": 100, "total": 100}
+            }
+            res, is_err = await self.server.handle_tool_call("get_enterprise_profile", {"target": "腾讯"}, readonly_user)
+            self.assertFalse(is_err)
+            self.assertEqual(res.get("status"), "success")
+            self.assertEqual(res["enterprise_info"]["name"], "腾讯计算机")
+            mock_build.assert_called_with("腾讯", "all", 1, 20, "")
 
 
 if __name__ == "__main__":

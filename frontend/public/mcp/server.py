@@ -42,6 +42,41 @@ TOOL_GET_ASSET_PROFILE = {
     }
 }
 
+TOOL_GET_ENTERPRISE_PROFILE = {
+    "name": "get_enterprise_profile",
+    "description": "获取指定企业标的（企业全称、简称、备案域名如 qq.com 或备案号）的全景生态资产画像与组织架构（包括工商背景、ICP备案网站、移动APP、微信小程序、公众号、企业微博、快应用及投资控股关系）。支持按资产分类下钻分页查询。",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "企业标的，支持企业工商全称（如'深圳市腾讯计算机系统有限公司'）、企业商业简称（如'腾讯'）、根域名（如'qq.com'，自动反查所属企业）或 ICP 备案主体/备案号"
+            },
+            "category": {
+                "type": "string",
+                "enum": ["all", "web", "app", "mapp", "wechat", "weibo", "kapp", "invest"],
+                "default": "all",
+                "description": "查询维度：'all'（默认总览画像与各维度统计指标）；'web'（网站备案域名）；'app'（移动应用）；'mapp'（微信小程序）；'wechat'（微信公众号）；'weibo'（企业微博）；'kapp'（快应用）；'invest'（对外投资与控股子公司）"
+            },
+            "page": {
+                "type": "integer",
+                "default": 1,
+                "description": "下钻指定 category 时的页码（从 1 开始）"
+            },
+            "size": {
+                "type": "integer",
+                "default": 20,
+                "description": "下钻指定 category 时每页记录条数（默认 20，最大 100）"
+            },
+            "task_id": {
+                "type": "string",
+                "description": "可选。24位企业测绘任务 ID。若指定则直接锁定该任务历史数据"
+            }
+        },
+        "required": ["target"]
+    }
+}
+
 
 # 默认预置凭据占位符（支持从 Web 端导出单文件客户端时动态预填充；优先级低于环境变量与 ARL_auth.md）
 DEFAULT_HOST = ""
@@ -578,6 +613,139 @@ def _fetch_asset_profile(target: str, task_id: str = "") -> dict:
     }
 
 
+def _fallback_aggregate_enterprise_profile(target: str, category: str = "all", page: int = 1, size: int = 20, task_id: str = "") -> dict:
+    """当后端原生 /api/mcp/enterprise_profile 未部署时，纯客户端降级调用标准 /api/icp/task 与 /api/icp/asset 接口聚合"""
+    host, token = _get_auth()
+    if not token:
+        return {
+            "status": "auth_error",
+            "message": "ARL 鉴权失败：未检测到有效 ARL_TOKEN，请检查环境变量或 ARL_auth.md",
+            "target": target
+        }
+
+    task_item = None
+    if task_id:
+        c, tasks = _request_items("/icp/task", {"_id": task_id})
+        err = _profile_error(c, target)
+        if err:
+            return err
+        if tasks:
+            task_item = tasks[0]
+
+    if not task_item:
+        c, tasks = _request_items("/icp/task", {"name": target, "size": 10})
+        err = _profile_error(c, target)
+        if err:
+            return err
+        if not tasks:
+            c, tasks = _request_items("/icp/task", {"target": target, "size": 10})
+            err = _profile_error(c, target)
+            if err:
+                return err
+
+        if tasks:
+            task_item = tasks[0]
+
+    if not task_item:
+        return {
+            "status": "not_found",
+            "target": target,
+            "message": f"未在 ARL 资产库中检索到与【{target}】匹配的企业测绘记录",
+            "suggestion": "可前往 ARL Web 控制台【资产分组 -> 企业生态资产 -> 新建企业测绘】，或确认名称/域名无误后重试"
+        }
+
+    tid = str(task_item.get("_id") or task_item.get("id") or "")
+    comp_name = task_item.get("company_name") or task_item.get("target") or task_item.get("name") or target
+
+    if category == "all":
+        counts = {}
+        for cat in ["web", "app", "mapp", "wechat", "weibo", "kapp", "invest"]:
+            code, resp_raw = _request_api("/icp/asset", {"task_id": tid, "query_type": cat, "size": 1})
+            if isinstance(resp_raw, dict) and "total" in resp_raw:
+                counts[cat] = resp_raw["total"]
+            else:
+                counts[cat] = len(resp_raw.get("items", [])) if isinstance(resp_raw, dict) else 0
+        counts["total"] = sum(counts.values())
+
+        samples = {}
+        _, web_items = _request_items("/icp/asset", {"task_id": tid, "query_type": "web", "size": 5})
+        if web_items:
+            samples["web_top"] = [
+                {
+                    "domain": x.get("domain") or x.get("ym"),
+                    "service_name": x.get("serviceName") or x.get("webName"),
+                    "licence": x.get("serviceLicence") or x.get("liscense")
+                }
+                for x in web_items
+            ]
+
+        return _clean_empty({
+            "status": "success",
+            "enterprise_info": {
+                "name": comp_name,
+                "task_id": tid,
+                "task_status": task_item.get("status", "done"),
+                "task_type": task_item.get("task_type", "icp")
+            },
+            "asset_counts": counts,
+            "samples": samples,
+            "drilldown_guidance": {
+                "tip": f"当前为【{comp_name}】全景生态资产总览画像。若需查看某维度的完整资产列表，请传入对应 category 参数下钻查询（例如 category='web' 查询全量备案域名）；若需对特定域名探查开放端口与漏洞风险，请调用 get_asset_profile(target='xxx.com')。"
+            }
+        })
+    else:
+        code, resp_raw = _request_api("/icp/asset", {"task_id": tid, "query_type": category, "page": page, "size": size})
+        err = _profile_error(code, target)
+        if err:
+            return err
+        items = resp_raw.get("items", []) if isinstance(resp_raw, dict) else []
+        total = resp_raw.get("total", len(items)) if isinstance(resp_raw, dict) else len(items)
+        return _clean_empty({
+            "status": "success",
+            "enterprise_name": comp_name,
+            "task_id": tid,
+            "category": category,
+            "pagination": {
+                "page": page,
+                "size": size,
+                "total": total,
+                "has_more": ((page - 1) * size + len(items)) < total
+            },
+            "items": items,
+            "tip": f"已返回第 {page} 页数据（共 {total} 条）。若需探测特定资产技术暴露面，可调用 get_asset_profile(target='...')"
+        })
+
+
+def _fetch_enterprise_profile(target: str, category: str = "all", page: int = 1, size: int = 20, task_id: str = "") -> dict:
+    """双阶获取企业生态画像：优先原生 /api/mcp/enterprise_profile，缺失时自动降级到 REST 聚合"""
+    params = {"target": target, "category": category, "page": page, "size": size}
+    if task_id:
+        params["task_id"] = task_id
+
+    code, resp_data = _request_api("/mcp/enterprise_profile", params)
+    if code == 200 and isinstance(resp_data, dict) and "code" not in resp_data:
+        return resp_data
+
+    # 拦截鉴权失败 (401 及 403)
+    if code in (401, 403) or (isinstance(resp_data, dict) and resp_data.get("code") in (401, 403)):
+        return {
+            "status": "auth_error",
+            "message": "ARL 鉴权失败：Token 无效或已过期，请检查 ARL_TOKEN 配置",
+            "target": target
+        }
+
+    # 仅当原生接口未部署 (404/405) 时，才降级为客户端标准接口聚合
+    if code in (404, 405):
+        return _fallback_aggregate_enterprise_profile(target=target, category=category, page=page, size=size, task_id=task_id)
+
+    err_msg = resp_data.get("message") if isinstance(resp_data, dict) else str(resp_data)
+    return {
+        "status": "error",
+        "message": f"ARL 服务端响应异常 (HTTP {code}): {err_msg}",
+        "target": target
+    }
+
+
 def handle_request(req: dict) -> dict:
     """处理 JSON-RPC 2.0 协议请求"""
     req_id = req.get("id")
@@ -615,13 +783,13 @@ def handle_request(req: dict) -> dict:
             "result": {}
         }
 
-    # 4. 列出可用工具集（单核心工具聚焦）
+    # 4. 列出可用工具集
     if method == "tools/list":
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "tools": [TOOL_GET_ASSET_PROFILE]
+                "tools": [TOOL_GET_ASSET_PROFILE, TOOL_GET_ENTERPRISE_PROFILE]
             }
         }
 
@@ -649,6 +817,43 @@ def handle_request(req: dict) -> dict:
             profile_data = _fetch_asset_profile(target=target, task_id=task_id)
             is_error = isinstance(profile_data, dict) and profile_data.get("status") in ("auth_error", "error")
             # 采用紧凑 JSON 序列化（消除多余空格与缩进，节省上下文 Token）
+            compact_json_str = json.dumps(profile_data, ensure_ascii=False, separators=(",", ":"))
+
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": compact_json_str
+                        }
+                    ],
+                    "isError": is_error
+                }
+            }
+
+        elif tool_name == "get_enterprise_profile":
+            target = str(args.get("target", "")).strip()
+            category = str(args.get("category", "all")).strip()
+            page = args.get("page", 1)
+            size = args.get("size", 20)
+            task_id = str(args.get("task_id", "")).strip()
+
+            if not target and not task_id:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [
+                            {"type": "text", "text": json.dumps({"status": "error", "message": "Missing required parameter: target"}, ensure_ascii=False)}
+                        ],
+                        "isError": True
+                    }
+                }
+
+            profile_data = _fetch_enterprise_profile(target=target, category=category, page=page, size=size, task_id=task_id)
+            is_error = isinstance(profile_data, dict) and profile_data.get("status") in ("auth_error", "error")
             compact_json_str = json.dumps(profile_data, ensure_ascii=False, separators=(",", ":"))
 
             return {

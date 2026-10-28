@@ -10,6 +10,8 @@ import logging
 import threading
 import subprocess
 import tempfile
+from collections import deque
+from functools import wraps
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
@@ -17,7 +19,7 @@ from urllib.parse import urlparse
 from app.config import Config, basedir, clear_system_config_cache, bump_system_config_version
 from app.utils.conn import ConnMongo
 from .backup_archive import read_manifest, stage_restore, install_staged, regular_backup_member
-from .backup_workers import RestoreWorkers
+from .backup_workers import RestoreWorkers, BackupOperationLock
 
 logger = logging.getLogger('arlv2')
 
@@ -28,6 +30,13 @@ class BackupProgressTracker:
     跨 Gunicorn 多 Worker 进程持久化的进度管理器。
     将状态原子写入 /tmp/arl_backup_status.json，避免多进程内存隔离导致状态读取不一致。
     """
+    start_time: Optional[float]
+    end_time: Optional[float]
+    logs: List[str]
+    error: Optional[str]
+    result: Optional[Dict[str, Any]]
+    archive_name: Optional[str]
+
     def __init__(self):
         self._lock = threading.Lock()
         # 初始化时优先从磁盘读取现有状态，若有正在运行的任务则继承；终态则进入 idle
@@ -70,12 +79,12 @@ class BackupProgressTracker:
             self.action = None    # backup | restore
             self.stage = ""
             self.percent = 0
-            self.start_time: Optional[float] = None
-            self.end_time: Optional[float] = None
-            self.logs: List[str] = []
-            self.error: Optional[str] = None
-            self.result: Optional[Dict[str, Any]] = None
-            self.archive_name: Optional[str] = None
+            self.start_time = None
+            self.end_time = None
+            self.logs = []
+            self.error = None
+            self.result = None
+            self.archive_name = None
             if save_disk:
                 self._save_to_disk(self._build_dict())
 
@@ -119,6 +128,7 @@ class BackupProgressTracker:
             if log_msg:
                 timestamp = datetime.now().strftime('%H:%M:%S')
                 self.logs.append(f"[{timestamp}] {log_msg}")
+                self.logs = self.logs[-50:]
                 logger.info(f"[BackupService] {log_msg}")
             self._save_to_disk(self._build_dict())
 
@@ -167,6 +177,19 @@ class BackupProgressTracker:
 
 progress_tracker = BackupProgressTracker()
 _task_lock = threading.Lock()
+
+
+def reserve_backup_operation():
+    return BackupOperationLock(os.path.join(get_backup_dir(), '.operation.lock')).acquire()
+
+
+def exclusive_backup_operation(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        operation_lock = kwargs.pop('_operation_lock', None) or reserve_backup_operation()
+        with operation_lock:
+            return func(*args, **kwargs)
+    return wrapped
 
 
 def get_backup_dir() -> str:
@@ -305,41 +328,48 @@ def run_command_streaming(cmd: List[str], stage_prefix: str, pct_start: int, pct
     流式执行外部工具命令（如 mongodump / mongorestore），
     实时从 stderr/stdout 逐行读取输出，并平滑步进进度与控制台日志。
     """
-    logger.info(f"Running streaming command: {' '.join(cmd[:3])} ...")
+    logger.info('Running backup command: %s', log_tag)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
         universal_newlines=True
     )
     
     lines_read = 0
-    all_err_lines = []
-    while True:
-        line = proc.stderr.readline()
-        if not line and proc.poll() is not None:
-            break
-        if line:
-            line_str = line.strip()
+    all_err_lines: deque[str] = deque(maxlen=10)
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            line_str = re.sub(r'mongodb(?:\+srv)?://\S+', '[redacted MongoDB URI]', line.strip())
             if not line_str:
                 continue
-            all_err_lines.append(line_str)
+            all_err_lines.append(line_str[:2000])
             lines_read += 1
-            clean_line = re.sub(r'^\d{4}-\d{2}-\d{2}T[\d:\.\+\-]+[\t\s]*', '', line_str)
+            clean_line = re.sub(r'^\d{4}-\d{2}-\d{2}T[\d:\.\+\-]+[\t\s]*', '', line_str)[:2000]
             is_milestone = any(k in clean_line.lower() for k in ["done", "writing", "restoring", "finished", "%"])
             if is_milestone or lines_read % 3 == 0:
-                # 拟真在 [pct_start, pct_end - 1] 区间步进
                 curr_pct = min(pct_end - 1, pct_start + (lines_read // 2))
                 progress_tracker.update(f"{stage_prefix}: {clean_line[:55]}", curr_pct, f"[{log_tag}] {clean_line}")
-
-    proc.wait()
+        proc.wait()
+    except BaseException:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
+    finally:
+        proc.stdout.close()
     if proc.returncode != 0:
-        err_msg = "\n".join(all_err_lines[-10:]) if all_err_lines else "外部命令异常退出"
+        err_msg = "\n".join(all_err_lines) if all_err_lines else "外部命令异常退出"
         raise RuntimeError(f"{log_tag} 命令执行失败 (退出码 {proc.returncode}): {err_msg[:200]}")
 
 
+@exclusive_backup_operation
 def create_backup_archive(include_screenshots: bool = True, note: str = "") -> Dict[str, Any]:
     """
     执行全量一键备份的核心实现函数
@@ -536,7 +566,7 @@ def list_all_backups() -> List[Dict[str, Any]]:
     扫描备份目录，返回所有合法的备份归档清单及其元数据
     """
     backup_dir = get_backup_dir()
-    backups = []
+    backups: List[Dict[str, Any]] = []
     
     if not os.path.isdir(backup_dir):
         return backups
@@ -594,6 +624,7 @@ def delete_backup_file(filename: str) -> bool:
     return False
 
 
+@exclusive_backup_operation
 def restore_backup_archive(archive_path: str, force: bool = False) -> Dict[str, Any]:
     """
     执行数据恢复的核心实现函数（基于 --drop 完全覆盖模式）

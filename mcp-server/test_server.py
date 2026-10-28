@@ -213,6 +213,67 @@ class MCPTests(unittest.TestCase):
         self.assertEqual((root / 'mcp-server/server.py').read_bytes(),
                          (root / 'frontend/public/mcp/server.py').read_bytes())
 
+    def test_tools_list_contains_both_tools(self):
+        """tools/list 声明包含 get_asset_profile 与 get_enterprise_profile 工具"""
+        resp = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tools = resp.get("result", {}).get("tools", [])
+        tool_names = [t["name"] for t in tools]
+        self.assertIn("get_asset_profile", tool_names)
+        self.assertIn("get_enterprise_profile", tool_names)
+
+    def test_call_enterprise_profile_missing_target(self):
+        """缺少必填 target 参数时返回工具调用错误"""
+        resp = server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "get_enterprise_profile", "arguments": {}}
+        })
+        self.assertTrue(resp.get("result", {}).get("isError"))
+        content_text = resp["result"]["content"][0]["text"]
+        self.assertIn("Missing required parameter: target", content_text)
+
+    def test_call_enterprise_profile_primary_endpoint(self):
+        """优先直接调用原生 /mcp/enterprise_profile 接口"""
+        mock_profile = {
+            "status": "success",
+            "enterprise_info": {"name": "测试科技有限公司", "task_id": "670000000000000000000001"},
+            "asset_counts": {"web": 10, "app": 2, "total": 12}
+        }
+        with patch.object(server, '_request_api', return_value=(200, mock_profile)) as mock_req:
+            resp = server.handle_request({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "get_enterprise_profile", "arguments": {"target": "测试科技", "category": "all"}}
+            })
+            self.assertFalse(resp.get("result", {}).get("isError"))
+            self.assertIn("测试科技有限公司", resp["result"]["content"][0]["text"])
+            mock_req.assert_called_with("/mcp/enterprise_profile", {"target": "测试科技", "category": "all", "page": 1, "size": 20})
+
+    def test_call_enterprise_profile_fallback_when_404(self):
+        """当原生 /mcp/enterprise_profile 返回 404 时，自动降级至标准 /icp/task 聚合"""
+        def fake_request_api(endpoint, params):
+            if endpoint == "/mcp/enterprise_profile":
+                return 404, {"code": 404, "message": "Not Found"}
+            elif endpoint == "/icp/task":
+                return 200, {"code": 200, "items": [{"_id": "670000000000000000000001", "name": "测试企业全景测绘", "company_name": "测试企业", "status": "done"}]}
+            elif endpoint == "/icp/asset":
+                return 200, {"code": 200, "total": 5, "items": [{"domain": "test.com", "serviceName": "测试网站"}]}
+            return 404, {}
+
+        with patch.object(server, '_request_api', side_effect=fake_request_api):
+            resp = server.handle_request({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "get_enterprise_profile", "arguments": {"target": "测试企业", "category": "all"}}
+            })
+            self.assertFalse(resp.get("result", {}).get("isError"))
+            content = json.loads(resp["result"]["content"][0]["text"])
+            self.assertEqual(content.get("status"), "success")
+            self.assertEqual(content["enterprise_info"]["name"], "测试企业")
+
     def test_loopback_tls_default_rejects_self_signed_and_explicit_ca_works(self):
         """默认拒绝自签；指定 CA 后按主机名口径放行 localhost、拒绝 IP 字面量。"""
         with patch.object(server, '_get_auth', return_value=(self.loopback_alias, 'fixture-token')), \

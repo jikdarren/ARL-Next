@@ -5,9 +5,8 @@ import sys
 import types
 from unittest.mock import AsyncMock, Mock
 
-from bson import ObjectId
 import pytest
-
+from bson import ObjectId
 from security_support import load_source
 from test_task_scope import ScopeFixture, load_nodes
 
@@ -70,7 +69,7 @@ def test_mixed_targets_use_standard_routing_and_payload(dispatch):
 
 
 def test_out_of_scope_batch_is_rejected_before_any_dispatch(dispatch):
-    result, error = call(dispatch, 'create_scan_task', {
+    _, error = call(dispatch, 'create_scan_task', {
         'name': 'fixture', 'target': 'www.example.com outside.org'})
     assert error
     assert dispatch.queue.calls == []

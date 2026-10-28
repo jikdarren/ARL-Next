@@ -7,25 +7,25 @@ import logging
 import math
 import os
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from pymongo import ReturnDocument
 from bson import ObjectId
+from pymongo import ReturnDocument
 
 from app import utils
 from app.config import Config
 
-
-READ_TOOLS = frozenset(('get_asset_profile', 'search_assets', 'get_task_status'))
+READ_TOOLS = frozenset(('get_asset_profile', 'get_enterprise_profile', 'search_assets', 'get_task_status'))
 WRITE_TOOLS = frozenset(('create_scan_task', 'stop_scan_task'))
 logger = logging.getLogger('arl_mcp')
 
 
 class MCPRequestError(Exception):
-    def __init__(self, message, status=403, retry_after=None):
+    def __init__(self, message, status=403, retry_after=None, audit=True):
         super().__init__(message)
         self.status = status
         self.retry_after = retry_after
+        self.audit = audit
 
 
 def authenticate_mcp_token(token, config=None):
@@ -54,13 +54,13 @@ def authenticate_mcp_token(token, config=None):
                     return None
                 # PyMongo's default codec returns UTC datetimes without tzinfo.
                 if expires.tzinfo is None:
-                    expires = expires.replace(tzinfo=timezone.utc)
-                if expires <= datetime.now(timezone.utc):
+                    expires = expires.replace(tzinfo=UTC)
+                if expires <= datetime.now(UTC):
                     return None
             return {'username': key.get('created_by', 'admin'), 'type': 'mcp_key',
                     'key_id': str(key['_id']), 'key_name': key.get('name', 'MCP-Key'),
                     'scopes': key.get('scopes', ['asset:read']), 'token': token}
-        user = utils.conn_db('user').find_one({'token': token, 'token_expire_at': {'$gt': datetime.now(timezone.utc)}})
+        user = utils.conn_db('user').find_one({'token': token, 'token_expire_at': {'$gt': datetime.now(UTC)}})
         if user:
             return {'username': user.get('username', 'admin'), 'type': 'user',
                     'key_id': 'legacy', 'key_name': '[Legacy Token]', 'token': token,
@@ -78,7 +78,9 @@ def load_mcp_policy(dispatch_enabled=None):
         switches = {name: True for name in READ_TOOLS}
         switches.update({name: bool(dispatch_enabled) for name in WRITE_TOOLS})
         for name, enabled in cfg.get('tool_switches', {}).items():
-            if name in switches and isinstance(enabled, bool):
+            if name in switches:
+                if type(enabled) is not bool:
+                    raise ValueError('Invalid stored MCP switch')
                 switches[name] = enabled
         return {'tool_switches': switches,
                 'max_search_limit': min(200, max(1, int(cfg.get('max_search_limit', 50)))),
@@ -109,14 +111,15 @@ def consume_mcp_quota(user, policy):
         counter = utils.conn_db('mcp_rate_limit').find_one_and_update(
             {'_id': f'{digest}:{bucket}'},
             {'$inc': {'count': 1}, '$setOnInsert': {
-                'expire_at': datetime.fromtimestamp((bucket + 2) * 60, timezone.utc)}},
+                'expire_at': datetime.fromtimestamp((bucket + 2) * 60, UTC)}},
             upsert=True, return_document=ReturnDocument.AFTER,
         )
     except Exception as exc:
         raise MCPRequestError('MCP quota service is temporarily unavailable', 503) from exc
     if counter['count'] > policy['rate_limit_per_min']:
         raise MCPRequestError('MCP per-key rate limit exceeded', 429,
-                              retry_after=max(1, math.ceil((bucket + 1) * 60 - now)))
+                              retry_after=max(1, math.ceil((bucket + 1) * 60 - now)),
+                              audit=counter['count'] == policy['rate_limit_per_min'] + 1)
 
 
 def record_mcp_audit(user, tool_name, target, args, result, is_error, duration_ms):
@@ -127,6 +130,7 @@ def record_mcp_audit(user, tool_name, target, args, result, is_error, duration_m
             status = 'denied'
         summaries = {
             'get_asset_profile': f"状态: {result.get('status', 'ok')}",
+            'get_enterprise_profile': f"企业: {result.get('enterprise_name') or target} (状态: {result.get('status', 'ok')})",
             'search_assets': f"命中 {result.get('total', 0)} 条记录",
             'get_task_status': f"任务状态: {result.get('status', 'unknown')}",
             'create_scan_task': f"新任务 ID: {result.get('task_id', '')}",
@@ -140,10 +144,10 @@ def record_mcp_audit(user, tool_name, target, args, result, is_error, duration_m
             'status': status, 'duration_ms': duration_ms,
             'summary': '' if is_error else summaries.get(tool_name, ''),
             'error_message': str(result.get('message', '')) if is_error else '',
-            'created_at': datetime.now(timezone.utc),
+            'created_at': datetime.now(UTC),
         })
         if user.get('type') == 'mcp_key':
             utils.conn_db('mcp_key').update_one({'_id': ObjectId(user['key_id'])}, {'$set': {
-                'last_used_at': datetime.now(timezone.utc), 'last_ip': user.get('client_ip', '')}})
+                'last_used_at': datetime.now(UTC), 'last_ip': user.get('client_ip', '')}})
     except Exception:
         logger.warning('Failed to record MCP audit log', exc_info=True)

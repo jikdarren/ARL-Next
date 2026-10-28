@@ -2,17 +2,19 @@
 
 import ast
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from security_support import app_env as _app_env
+from security_support import load_source, make_client
 
-from security_support import app_env, load_source, make_client
+app_env = _app_env
 
 
 @pytest.fixture
@@ -71,7 +73,7 @@ def test_existing_sessions_recheck_credentials(app_env, mcp, change, include_tok
     if change == 'delete':
         app_env.db.mcp_key.delete_one({'_id': key_id})
     else:
-        values = {'status': 'revoked'} if change == 'revoke' else {'expire_at': datetime.now(timezone.utc) - timedelta(seconds=1)}
+        values = {'status': 'revoked'} if change == 'revoke' else {'expire_at': datetime.now(UTC) - timedelta(seconds=1)}
         app_env.db.mcp_key.update_one({'_id': key_id}, {'$set': values})
     profile = Mock(side_effect=AssertionError('Revoked credentials must not read assets'))
     app_env.monkeypatch.setattr(module, 'build_asset_profile', profile)
@@ -94,7 +96,7 @@ def test_explicit_other_credential_cannot_borrow_session(app_env, mcp):
 
 def test_naive_utc_expiry_is_independent_of_container_timezone(app_env, mcp):
     _, server = mcp
-    token, key_id = create_key(app_env, expires=datetime.now(timezone.utc) + timedelta(hours=1))
+    token, key_id = create_key(app_env, expires=datetime.now(UTC) + timedelta(hours=1))
     assert app_env.db.mcp_key.find_one({'_id': key_id})['expire_at'].tzinfo is None
     original = os.environ.get('TZ')
     try:
@@ -102,7 +104,7 @@ def test_naive_utc_expiry_is_independent_of_container_timezone(app_env, mcp):
             os.environ['TZ'] = zone
             time.tzset()
             assert server.authenticate_token(token)
-        app_env.db.mcp_key.update_one({'_id': key_id}, {'$set': {'expire_at': datetime.now(timezone.utc) - timedelta(seconds=1)}})
+        app_env.db.mcp_key.update_one({'_id': key_id}, {'$set': {'expire_at': datetime.now(UTC) - timedelta(seconds=1)}})
         assert server.authenticate_token(token) is None
     finally:
         if original is None:
@@ -113,15 +115,15 @@ def test_naive_utc_expiry_is_independent_of_container_timezone(app_env, mcp):
 
 
 def test_discovery_and_execution_share_policy_and_scopes(app_env, mcp):
-    module, server = mcp
+    _, server = mcp
     server._dispatch_enabled = False
     app_env.db.mcp_config.insert_one({'_id': 'global', 'tool_switches': {
         'create_scan_task': True, 'stop_scan_task': True, 'search_assets': False}})
     readonly = {'scopes': ['asset:read']}
     operator = {'scopes': ['asset:read', 'task:dispatch']}
-    assert {t['name'] for t in server.get_supported_tools(readonly)} == {'get_asset_profile', 'get_task_status'}
+    assert {t['name'] for t in server.get_supported_tools(readonly)} == {'get_asset_profile', 'get_enterprise_profile', 'get_task_status'}
     assert {t['name'] for t in server.get_supported_tools(operator)} == {
-        'get_asset_profile', 'get_task_status', 'create_scan_task', 'stop_scan_task'}
+        'get_asset_profile', 'get_enterprise_profile', 'get_task_status', 'create_scan_task', 'stop_scan_task'}
     result, error = asyncio.run(server.handle_tool_call('search_assets', {'query': 'fixture'}, operator))
     assert error and result['code'] == 403
     app_env.db.mcp_config.update_one({'_id': 'global'}, {'$set': {'tool_switches.create_scan_task': False}})

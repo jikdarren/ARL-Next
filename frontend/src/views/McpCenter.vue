@@ -347,6 +347,7 @@
                   :placeholder="pageText('pages.mcpFilterToolPlaceholder')"
                 >
                   <a-select-option value="get_asset_profile">get_asset_profile</a-select-option>
+                  <a-select-option value="get_enterprise_profile">get_enterprise_profile</a-select-option>
                   <a-select-option value="search_assets">search_assets</a-select-option>
                   <a-select-option value="get_task_status">get_task_status</a-select-option>
                   <a-select-option value="create_scan_task">create_scan_task</a-select-option>
@@ -690,7 +691,7 @@ import {
 } from '@ant-design/icons-vue';
 import request from '@/utils/request';
 import { copyText } from '@/utils/clipboard';
-import { resolveMcpCredential } from '@/utils/mcpCredentials';
+import { resolveMcpCredential, createStdioServerConfig } from '@/utils/mcpCredentials';
 
 const { t } = useI18n({ useScope: 'global' });
 const pageText = t;
@@ -808,6 +809,7 @@ const formattedParams = (str) => {
 const isSavingPolicy = ref(false);
 const toolSwitches = reactive({
   get_asset_profile: true,
+  get_enterprise_profile: true,
   search_assets: true,
   get_task_status: true,
   create_scan_task: false,
@@ -820,6 +822,7 @@ const policyForm = reactive({
 
 const toolSwitchConfigs = [
   { key: 'get_asset_profile', desc: pageText('pages.mcpToolDescProfile'), isDangerous: false },
+  { key: 'get_enterprise_profile', desc: pageText('pages.mcpToolDescEnterprise'), isDangerous: false },
   { key: 'search_assets', desc: pageText('pages.mcpToolDescSearch'), isDangerous: false },
   { key: 'get_task_status', desc: pageText('pages.mcpToolDescTask'), isDangerous: false },
   { key: 'create_scan_task', desc: pageText('pages.mcpToolDescCreate'), isDangerous: true },
@@ -850,12 +853,7 @@ const configSnippet = computed(() => {
   } else {
     const stdioConfig = {
       "mcpServers": {
-        "arl-next": {
-          "command": "python3",
-          "args": [
-            "~/Downloads/arl_mcp.py"
-          ]
-        }
+        "arl-next": createStdioServerConfig()
       }
     };
     return JSON.stringify(stdioConfig, null, 2);

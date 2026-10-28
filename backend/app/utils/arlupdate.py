@@ -1276,6 +1276,7 @@ def ensure_mcp_governance_schema():
             {"$setOnInsert": {
                 "tool_switches": {
                     "get_asset_profile": True,
+                    "get_enterprise_profile": True,
                     "search_assets": True,
                     "get_task_status": True,
                     "create_scan_task": False,
