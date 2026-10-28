@@ -296,7 +296,7 @@ ARL-Next integrates the Model Context Protocol (MCP 2024-11-05 specification) fo
 | `/mcp/sse` | HTTP GET (`text/event-stream`) | Remote MCP SSE handshake endpoint; maintains persistent stream and yields `endpoint` events | `Authorization: Bearer <TOKEN>`, `Token: <TOKEN>`, or `?token=<TOKEN>` |
 | `/mcp/message` | HTTP POST (`application/json`) | Remote MCP upstream channel; receives JSON-RPC 2.0 messages (requires `?sessionId=`) | Same as above |
 | `/api/mcp/asset_profile` | HTTP GET (`application/json`) | Native multi-dimensional asset profiling REST endpoint across network/web/cert/vuln collections | `Token: <TOKEN>` |
-| `/api/mcp/export_server` | HTTP GET (`text/x-python`) | Dynamically generates and exports pre-credentialed standalone client script (`arl_mcp.py`) | `Token: <TOKEN>` |
+| `/api/mcp/export_server` | HTTP GET / POST (`text/x-python`) | Export a client script; dedicated keys use POST JSON `raw_key`, GET uses the current account credential only | Login token or system API key |
 | `/api/mcp/task_detail_export`| HTTP GET (`text/csv`) | Task detail CSV export across specific tabs with formula injection mitigation | `Token: <TOKEN>` |
 | `/api/mcp/overview` | HTTP GET (`application/json`) | MCP Governance Center dashboard & call stats (call count, active keys, error count) | `Token: <TOKEN>` |
 | `/api/mcp/keys` | HTTP GET / POST (`application/json`) | Query and issue dedicated MCP API Keys (with granular Scope permissions) | `Token: <TOKEN>` |
@@ -311,9 +311,23 @@ ARL-Next integrates the Model Context Protocol (MCP 2024-11-05 specification) fo
 | `get_asset_profile` | Read-only Profile | `target` (required), `task_id` (optional) | Unified asset intelligence correlation (IPs, ports, services, fingerprints, certs, vulns, leaks) | Enabled by default |
 | `search_assets` | Read-only Search | `query` (required), `asset_type`, `limit` | Searches sites, IPs, domains, or known vulnerabilities | Enabled by default |
 | `get_task_status` | Read-only Status | `task_id` (required) | Inspects scanning progress, execution state, and metric counts | Enabled by default |
-| `create_scan_task` | Controlled Dispatch | `name`, `target`, `policy_id` | Submits a scan task to the Celery worker queue | Requires `ARL_MCP_ENABLE_DISPATCH=true` |
-| `stop_scan_task` | Controlled Dispatch | `task_id` (required) | Terminates an active scan task | Requires `ARL_MCP_ENABLE_DISPATCH=true` |
+| `create_scan_task` | Controlled Dispatch | `name`, `target`, `policy_id` | Uses standard target validation and queue routing | Tool enabled in governance settings and `task:dispatch` scope |
+| `stop_scan_task` | Controlled Dispatch | `task_id` (required) | Revokes the Celery task and records its stopped state | Tool enabled in governance settings and `task:dispatch` scope |
+
+- Discovery and execution share tool switches and key scopes. Explicit database switches take precedence; `ARL_MCP_ENABLE_DISPATCH` supplies the write-tool default only when no switch is saved.
+- Every SSE message revalidates the handshake credential. Revocation, deletion, expiry or rotation prevents an existing session from making further calls. Explicit headers must match the handshake credential. Expiry is evaluated in UTC.
+- Dedicated Stdio keys can access the read-only `/api/mcp/asset_profile` endpoint with `asset:read`, without acquiring general REST administrator access. SSE and this endpoint share a per-credential fixed-minute quota. Exceeding it returns HTTP `429` with `Retry-After`; an unavailable quota store returns `503`.
+- Configuration generation requires a complete key. Newly created plaintext stays in the current page only; after reopening it, paste the previously saved full value. Masked prefixes are never credentials. Export with `POST /api/mcp/export_server` and JSON `{"host":"https://arl.example","raw_key":"<complete MCP key>"}`, keeping the account credential in the `Token` header. GET rejects `raw_key`.
+- Mixed targets may create multiple scan tasks. `task_ids` contains all resulting IDs; the compatibility field `task_id` contains the first. Policy-bound asset scopes are validated before submission.
 
 > [!NOTE]
 > - Production Nginx reverse proxy routes `/mcp/sse` with unbuffered streaming and a 24-hour persistent timeout;
 > - When accessing self-signed IP deployments, if the client drops connections due to TLS chain verification, use the local Stdio script (built-in certificate pinning) or import the server CA certificate into the operating system trust store.
+
+## 7. Task handling during backup restoration
+
+After validating the entire archive, restoration pauses scan consumers and checks workers, active work and queued work. Pending work requires `force=true`. Forced restoration revokes active, reserved, scheduled and queued tasks, then waits for workers to confirm termination before `mongorestore --drop`. Consumers remain paused throughout restoration. Remaining messages belonging to the old data are cleared, unfinished tasks are marked stopped, and consumption resumes.
+
+Unreachable workers, missing control acknowledgements or a stop timeout abort restoration. A failure after database replacement starts leaves consumers paused; inspect the data and restore error before restarting workers. Both Web and CLI restoration require responsive workers and a reachable broker for these checks.
+
+`running_tasks` now counts unfinished scan and GitHub tasks, including queued tasks.

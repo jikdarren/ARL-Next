@@ -298,7 +298,7 @@ ARL-Next 集成了 Model Context Protocol (MCP 2024-11-05 规范)，支持 AI �
 | `/mcp/sse` | HTTP GET (`text/event-stream`) | 远程 MCP SSE 握手端点，维持长连接并推送 `endpoint` 与消息事件 | `Authorization: Bearer <TOKEN>`、`Token: <TOKEN>` 或 `?token=<TOKEN>` |
 | `/mcp/message` | HTTP POST (`application/json`) | 远程 MCP 消息上行端点，接收 JSON-RPC 2.0 请求（需携带 `?sessionId=`） | 同上 |
 | `/api/mcp/asset_profile` | HTTP GET (`application/json`) | 原生多维资产画像聚合接口，跨集合提取网络/Web/证书/漏洞/泄露情报 | `Token: <TOKEN>` |
-| `/api/mcp/export_server` | HTTP GET (`text/x-python`) | 动态生成并导出已预填充凭据的独立单文件客户端脚本 (`arl_mcp.py`) | `Token: <TOKEN>` |
+| `/api/mcp/export_server` | HTTP GET / POST (`text/x-python`) | 导出客户端脚本；专用 Key 使用 POST JSON 的 `raw_key`，GET 仅使用当前登录凭据 | 登录 Token 或系统 API Key |
 | `/api/mcp/task_detail_export`| HTTP GET (`text/csv`) | 任务详情分维度安全 CSV 数据导出（内置公式注入防御） | `Token: <TOKEN>` |
 | `/api/mcp/overview` | HTTP GET (`application/json`) | MCP 治理中心大盘与调用统计概览（调用量、活跃 Key、异常数） | `Token: <TOKEN>` |
 | `/api/mcp/keys` | HTTP GET / POST (`application/json`) | MCP 专用 API Key 列表查询与签发（支持细粒度 Scope 授权） | `Token: <TOKEN>` |
@@ -313,9 +313,23 @@ ARL-Next 集成了 Model Context Protocol (MCP 2024-11-05 规范)，支持 AI �
 | `get_asset_profile` | 只读画像 | `target` (必填), `task_id` (可选) | 综合资产情报关联（IP/端口/服务/Web指纹/证书/漏洞/泄露） | 默认启用 |
 | `search_assets` | 只读检索 | `query` (必填), `asset_type`, `limit` | 依条件检索站点、IP、域名或已知漏洞记录 | 默认启用 |
 | `get_task_status` | 只读状态 | `task_id` (必填) | 查询任务执行状态、进度与统计数据 | 默认启用 |
-| `create_scan_task` | 受控调度 | `name`, `target`, `policy_id` | 向 Celery 队列投递新扫描任务 | 需服务端配置 `ARL_MCP_ENABLE_DISPATCH=true` |
-| `stop_scan_task` | 受控调度 | `task_id` (必填) | 紧急终止进行中的扫描任务 | 需服务端配置 `ARL_MCP_ENABLE_DISPATCH=true` |
+| `create_scan_task` | 受控调度 | `name`, `target`, `policy_id` | 通过标准目标校验与轻重队列投递扫描任务 | 管理台启用工具且 Key 具有 `task:dispatch` |
+| `stop_scan_task` | 受控调度 | `task_id` (必填) | 撤销 Celery 任务并记录停止状态 | 管理台启用工具且 Key 具有 `task:dispatch` |
+
+- `tools/list` 和执行入口使用相同的全局开关及 Key Scope。数据库中的显式开关优先；没有保存开关时，`ARL_MCP_ENABLE_DISPATCH` 作为写工具的默认值。
+- SSE 每条上行消息重新校验握手凭据；吊销、删除、到期或轮换凭据后，旧 `sessionId` 不能继续调用。显式请求头必须与握手凭据一致。有效期统一按 UTC 判断。
+- Stdio 专用 Key 可访问只读 `/api/mcp/asset_profile`，需要 `asset:read`，不具备其他管理 REST 接口权限。SSE 和该接口共用每个凭据的固定分钟限额；超限返回 HTTP `429` 和 `Retry-After`，配额存储不可用时返回 `503`。
+- 管理台生成配置需要完整 Key。新建 Key 的明文仅保留在当前页面；再次打开页面时需粘贴先前保存的完整值，不能使用列表中的脱敏前缀。导出脚本使用 `POST /api/mcp/export_server`，JSON 为 `{"host":"https://arl.example","raw_key":"<完整 MCP Key>"}`；账号凭据仍放在 `Token` 请求头。GET 不接受 `raw_key`。
+- `create_scan_task` 对混合目标可能创建多个任务，响应通过 `task_ids` 返回全部 ID，兼容字段 `task_id` 为第一个 ID。策略绑定的资产范围仍在提交前统一校验。
 
 > [!NOTE]
 > - 生产反向代理已针对 `/mcp/sse` 配置专用流式转发（禁用缓冲、长连接保活 24 小时）；
 > - 经 IP 访问自签证书部署时，客户端若因 TLS 校验阻断直连，推荐使用本地 Stdio 脚本接入（已内置证书自适应），或将服务端 CA 证书导入系统信任库。
+
+## 7. 备份恢复时的任务处理
+
+恢复先校验完整归档，再暂停扫描队列消费并检查 Worker、运行任务和排队任务。存在未完成任务时需要 `force=true`；强制恢复会撤销运行、预取、定时和排队任务，并等待 Worker 确认停止后才执行 `mongorestore --drop`。恢复期间队列保持暂停，恢复前数据对应的剩余消息在恢复后清理，未完成任务状态置为已停止，再恢复消费。
+
+Worker 不可达、控制指令没有完整确认或停止超时，均中止恢复。数据库覆盖已经开始后若恢复失败，队列保持暂停；管理员应先检查数据和恢复错误，确认后再重启 Worker。Web 与 CLI 都使用此检查，需要可响应控制指令的 Worker 和消息队列。
+
+`running_tasks` 统计扫描与 GitHub 任务中的未完成项，包含排队中的任务。

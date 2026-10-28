@@ -7,10 +7,15 @@ from datetime import datetime, timedelta, timezone
 import csv
 import io
 import json
+import time
 from urllib.parse import urlsplit
 
 from app.utils import get_logger, auth
 from app import utils
+from app.mcp_security import (
+    MCPRequestError, authenticate_mcp_token, authorize_tool,
+    consume_mcp_quota, load_mcp_policy, record_mcp_audit,
+)
 
 ns = Namespace('mcp', description="MCP API 接口")
 logger = get_logger()
@@ -144,22 +149,46 @@ from app.mcp_asset import build_asset_profile, _clean_empty
 
 @ns.route('/asset_profile')
 class MCPAssetProfile(Resource):
-    @auth
     def get(self):
         """
         MCP 资产画像接口（站点/IP/子域名维度聚合，按需裁剪字段以收敛上下文开销）
         """
+        # Dedicated keys are accepted only on this read-only MCP endpoint;
+        # they must never become general-purpose REST administrator tokens.
+        token = request.headers.get('Token') or request.headers.get('Authorization', '')
+        user = authenticate_mcp_token(token)
+        if not user:
+            return {'code': 401, 'message': 'Invalid or expired MCP credential'}, 401
+        user['client_ip'] = request.headers.get('X-Real-IP') or request.remote_addr or ''
         target = request.args.get('target', '').strip()
         task_id = request.args.get('task_id', '').strip()
-        if not target:
-            return {"code": 400, "message": "Missing target parameter"}, 400
-
-        data = build_asset_profile(target, task_id)
-        return data
+        started = time.monotonic()
+        result, is_error = {}, True
+        try:
+            policy = load_mcp_policy()
+            authorize_tool(user, 'get_asset_profile', policy)
+            consume_mcp_quota(user, policy)
+            if not target:
+                result = {'code': 400, 'message': 'Missing target parameter'}
+                return result, 400
+            result = build_asset_profile(target, task_id)
+            is_error = result.get('status') in ('error', 'auth_error') or result.get('code', 200) != 200
+            return result
+        except MCPRequestError as error:
+            headers = {'Retry-After': str(error.retry_after)} if error.retry_after is not None else {}
+            result = {'code': error.status, 'status': 'denied', 'message': str(error)}
+            return result, error.status, headers
+        finally:
+            record_mcp_audit(user, 'get_asset_profile', target, {'target': target, 'task_id': task_id},
+                             result, is_error, int((time.monotonic() - started) * 1000))
 
 
 @ns.route('/export_server')
 class MCPExportServer(Resource):
+    @auth
+    def post(self):
+        return self.get()
+
     @auth
     def get(self):
         """
@@ -195,7 +224,10 @@ class MCPExportServer(Resource):
         # 2. 浏览器 Origin / Referer 请求头
         # 3. 反向代理头 X-Forwarded-Host / Host 与 X-Forwarded-Proto
         # 4. request.host_url
-        req_host = request.args.get("host", "").strip()
+        export_args = (request.get_json(silent=True) or {}) if request.method == 'POST' else request.args
+        if not hasattr(export_args, 'get') or (request.method == 'GET' and request.args.get('raw_key')):
+            return {'code': 400, 'message': 'Send dedicated MCP credentials in a POST JSON body'}, 400
+        req_host = str(export_args.get("host", "")).strip()
         if req_host:
             host = req_host.rstrip("/")
         else:
@@ -228,7 +260,11 @@ class MCPExportServer(Resource):
             return {'code': 400, 'message': 'Invalid server origin'}, 400
 
         # Serialize values as Python-compatible JSON string literals, never source.
-        raw_key = request.args.get("raw_key", "").strip()
+        raw_key = str(export_args.get("raw_key", "")).strip() if request.method == 'POST' else ''
+        if raw_key:
+            identity = authenticate_mcp_token(raw_key)
+            if not identity or identity.get('type') != 'mcp_key' or 'asset:read' not in identity.get('scopes', []):
+                return {'code': 400, 'message': 'A complete, active MCP key with asset:read scope is required'}, 400
         effective_token = raw_key or user_token
         if effective_token:
             content = content.replace('DEFAULT_TOKEN = ""', 'DEFAULT_TOKEN = ' + json.dumps(effective_token))

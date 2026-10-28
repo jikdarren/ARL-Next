@@ -28,7 +28,7 @@ create_backup_model = ns.model('CreateBackup', {
 
 restore_model = ns.model('RestoreBackup', {
     'filename': fields.String(required=True, description='备份归档文件名'),
-    'force': fields.Boolean(default=False, description='若存在运行中任务，是否强制终止并继续恢复')
+    'force': fields.Boolean(default=False, description='是否终止运行中及排队中的任务并继续恢复')
 })
 
 
@@ -246,7 +246,7 @@ class RestoreBackup(ARLResource):
         if running_tasks > 0 and not force:
             return {
                 "code": 409,
-                "message": f"系统当前有 {running_tasks} 个正在进行的扫描任务，执行覆盖恢复将中断这些任务。",
+                "message": f"系统当前有 {running_tasks} 个运行中或排队中的任务，执行覆盖恢复将终止这些任务。",
                 "data": {
                     "running_tasks": running_tasks,
                     "require_force": True

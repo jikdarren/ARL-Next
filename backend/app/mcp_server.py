@@ -16,8 +16,7 @@ import secrets
 import sys
 import time
 import urllib.parse
-from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple, Set
+from typing import Dict, Optional, Tuple
 
 try:
     from app import utils
@@ -29,6 +28,11 @@ except ImportError:
     from app import utils
     from app.config import Config
     from app.mcp_asset import build_asset_profile, _clean_empty
+
+from app.mcp_security import (
+    MCPRequestError, authenticate_mcp_token, authorize_tool,
+    consume_mcp_quota, load_mcp_policy, record_mcp_audit,
+)
 
 logger = logging.getLogger("arl_mcp")
 if not logger.handlers:
@@ -141,9 +145,10 @@ TOOL_STOP_SCAN_TASK = {
 
 class MCPSession:
     """管理单客户端 SSE 长连接会话与消息下行队列"""
-    def __init__(self, session_id: str, auth_user: dict):
+    def __init__(self, session_id: str, auth_user: dict, credential=None):
         self.session_id = session_id
         self.auth_user = auth_user
+        self.credential = auth_user.get('token', '') if credential is None else credential
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=100)
         self.created_at = time.time()
         self.last_active = time.time()
@@ -165,82 +170,21 @@ class MCPServer:
         self.server: Optional[asyncio.AbstractServer] = None
         self._dispatch_enabled = os.environ.get("ARL_MCP_ENABLE_DISPATCH", "").strip().lower() in ("true", "1", "yes")
 
-    def get_supported_tools(self) -> list:
-        tools = [TOOL_GET_ASSET_PROFILE, TOOL_SEARCH_ASSETS, TOOL_GET_TASK_STATUS]
-        if self._dispatch_enabled:
-            tools.extend([TOOL_CREATE_SCAN_TASK, TOOL_STOP_SCAN_TASK])
+    def get_supported_tools(self, user_info=None) -> list:
+        policy = load_mcp_policy(self._dispatch_enabled)
+        user_info = user_info or {'scopes': ['asset:read', 'task:dispatch']}
+        tools = []
+        for tool in (TOOL_GET_ASSET_PROFILE, TOOL_SEARCH_ASSETS, TOOL_GET_TASK_STATUS,
+                     TOOL_CREATE_SCAN_TASK, TOOL_STOP_SCAN_TASK):
+            try:
+                authorize_tool(user_info, tool['name'], policy)
+            except MCPRequestError:
+                continue
+            tools.append(tool)
         return tools
 
     def authenticate_token(self, token: str) -> Optional[dict]:
-        """双通道凭据校验：比对系统 API_KEY、独立 MCP API Key 或 MongoDB user 会话"""
-        if not getattr(Config, "AUTH", True):
-            return {"username": "anonymous", "type": "no_auth", "scopes": ["asset:read", "task:dispatch"], "key_id": "none", "key_name": "anonymous"}
-
-        if not token or not isinstance(token, str):
-            return None
-
-        clean_token = token.strip()
-        if clean_token.startswith("Bearer "):
-            clean_token = clean_token[7:].strip()
-
-        # 1. 优先校验系统全局 API_KEY (内部运维调用，无需查库)
-        api_key = getattr(Config, "API_KEY", "")
-        if isinstance(api_key, str) and api_key and hmac.compare_digest(clean_token.encode(), api_key.encode()):
-            return {
-                "username": "ARL-API",
-                "key_id": "legacy",
-                "key_name": "[System API Key]",
-                "scopes": ["asset:read", "task:dispatch"],
-                "token": clean_token,
-                "type": "api"
-            }
-
-        # 2. 校验专用 MCP API Key (以 arl_mcp_ 前缀标识)
-        if clean_token.startswith("arl_mcp_"):
-            try:
-                import hashlib
-                key_hash = hashlib.sha256(clean_token.encode('utf-8')).hexdigest()
-                mcp_key = utils.conn_db('mcp_key').find_one({'key_hash': key_hash})
-                if mcp_key:
-                    if mcp_key.get('status') != 'active':
-                        return None
-                    expire_at = mcp_key.get('expire_at')
-                    if expire_at and isinstance(expire_at, datetime):
-                        now_dt = datetime.now() if expire_at.tzinfo is None else datetime.now(timezone.utc)
-                        if expire_at < now_dt:
-                            return None
-                    return {
-                        "username": mcp_key.get("created_by", "admin"),
-                        "key_id": str(mcp_key["_id"]),
-                        "key_name": mcp_key.get("name", "MCP-Key"),
-                        "scopes": mcp_key.get("scopes", ["asset:read"]),
-                        "token": clean_token,
-                        "type": "mcp_key"
-                    }
-            except Exception as e:
-                logger.warning(f"MCP Key auth lookup failed: {e}")
-            return None
-
-        # 3. 降级兼容存量 User 登录 Token
-        try:
-            now = datetime.now(timezone.utc)
-            user = utils.conn_db('user').find_one({
-                'token': clean_token,
-                'token_expire_at': {'$gt': now}
-            })
-            if user:
-                return {
-                    "username": user.get("username", "admin"),
-                    "key_id": "legacy",
-                    "key_name": "[Legacy Token]",
-                    "scopes": ["asset:read", "task:dispatch"],
-                    "token": clean_token,
-                    "type": "user"
-                }
-        except Exception as e:
-            logger.warning(f"Database auth lookup failed: {e}")
-
-        return None
+        return authenticate_mcp_token(token, config=Config)
 
     def _extract_token_from_request(self, headers: dict, query_params: dict) -> str:
         """优先提取 Header，兜底提取 Query 参数"""
@@ -260,87 +204,21 @@ class MCPServer:
 
         return ""
 
-    async def _record_audit_log(self, user_info: dict, tool_name: str, target: str, args: dict, result: dict, is_err: bool, duration_ms: int):
-        """异步在 MongoDB 中留存 MCP 审计日志，并更新 Key 活跃信息"""
-        def _sync_insert():
-            try:
-                status = "error" if is_err else "success"
-                err_msg = ""
-                summary = ""
-                if is_err and isinstance(result, dict):
-                    err_msg = str(result.get("message", ""))
-                    if result.get("status") == "denied":
-                        status = "denied"
-                elif not is_err and isinstance(result, dict):
-                    if tool_name == "get_asset_profile":
-                        summary = f"状态: {result.get('status', 'ok')}"
-                    elif tool_name == "search_assets":
-                        summary = f"命中 {result.get('total', 0)} 条记录"
-                    elif tool_name == "get_task_status":
-                        summary = f"任务状态: {result.get('status', 'unknown')}"
-                    elif tool_name == "create_scan_task":
-                        summary = f"新任务 ID: {result.get('task_id', '')}"
-                    elif tool_name == "stop_scan_task":
-                        summary = f"已停止任务: {result.get('task_id', '')}"
+    async def _record_audit_log(self, user_info, tool_name, target, args, result, is_err, duration_ms):
+        await asyncio.to_thread(record_mcp_audit, user_info, tool_name, target, args, result, is_err, duration_ms)
 
-                p_str = json.dumps(args, ensure_ascii=False)
-                if len(p_str) > 200:
-                    p_str = p_str[:200] + "..."
-
-                doc = {
-                    "key_id": user_info.get("key_id", "legacy"),
-                    "key_name": user_info.get("key_name", "[Legacy Token]"),
-                    "client_ip": user_info.get("client_ip", ""),
-                    "tool_name": tool_name,
-                    "target": target,
-                    "params_summary": p_str,
-                    "status": status,
-                    "duration_ms": duration_ms,
-                    "summary": summary,
-                    "error_message": err_msg,
-                    "created_at": datetime.now(timezone.utc)
-                }
-                utils.conn_db('mcp_log').insert_one(doc)
-
-                if user_info.get("type") == "mcp_key" and user_info.get("key_id") and user_info.get("key_id") != "legacy":
-                    from bson import ObjectId
-                    utils.conn_db('mcp_key').update_one(
-                        {"_id": ObjectId(user_info["key_id"])},
-                        {"$set": {
-                            "last_used_at": datetime.now(timezone.utc),
-                            "last_ip": user_info.get("client_ip", "")
-                        }}
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to record audit log: {e}")
-
-        await asyncio.to_thread(_sync_insert)
-
-    async def handle_tool_call(self, name: str, args: dict, user_info: dict) -> Tuple[dict, bool]:
+    async def handle_tool_call(self, name: str, args: dict, user_info: dict, *, quota_checked=False) -> Tuple[dict, bool]:
         """异步执行指定 Tool 并返回 (结果对象, is_error)，并记录审计日志"""
         start_time = time.time()
         target = str(args.get("target", "") or args.get("query", "") or args.get("task_id", "") or args.get("name", "")).strip()
         result, is_err = {}, False
 
         try:
-            # 1. 检查全局配置与工具开关
-            try:
-                cfg = utils.conn_db('mcp_config').find_one({"_id": "global"}) or {}
-                switches = cfg.get("tool_switches", {})
-                max_search_limit = int(cfg.get("max_search_limit", 50))
-            except Exception:
-                switches = {}
-                max_search_limit = 50
-
-            if switches.get(name) is False:
-                result, is_err = {"status": "denied", "message": f"Tool '{name}' is currently disabled in system settings"}, True
-                return result, is_err
-
-            # 2. 检查权限 Scope
-            user_scopes = user_info.get("scopes", ["asset:read"])
-            if name in ("create_scan_task", "stop_scan_task") and "task:dispatch" not in user_scopes:
-                result, is_err = {"status": "denied", "message": "Permission denied: key lacks 'task:dispatch' scope"}, True
-                return result, is_err
+            policy = await asyncio.to_thread(load_mcp_policy, self._dispatch_enabled)
+            authorize_tool(user_info, name, policy)
+            if not quota_checked:
+                await asyncio.to_thread(consume_mcp_quota, user_info, policy)
+            max_search_limit = policy['max_search_limit']
 
             # 3. 具体工具分流执行
             if name == "get_asset_profile":
@@ -417,10 +295,6 @@ class MCPServer:
                 return result, is_err
 
             elif name == "create_scan_task":
-                dispatch_allowed = self._dispatch_enabled or switches.get("create_scan_task", False)
-                if not dispatch_allowed:
-                    result, is_err = {"status": "error", "message": "Task dispatching is disabled on this server"}, True
-                    return result, is_err
                 task_name = str(args.get("name", "")).strip()
                 target_str = str(args.get("target", "")).strip()
                 policy_id = str(args.get("policy_id", "")).strip()
@@ -429,8 +303,9 @@ class MCPServer:
                     return result, is_err
 
                 def _dispatch_task():
-                    from app.routes.task import TaskByPolicy
-                    from app.utils.user import get_options_by_policy_id
+                    from app.helpers.policy import get_options_by_policy_id
+                    from app.helpers.task import submit_task_task
+                    from app.modules import TaskTag
                     # 查找默认策略
                     pol_id = policy_id
                     if not pol_id:
@@ -440,47 +315,40 @@ class MCPServer:
                     if not pol_id:
                         return {"status": "error", "message": "No scan policy available to submit task"}
 
-                    options = get_options_by_policy_id(pol_id, "task")
-                    from app.celerytask import celery
-                    from bson import ObjectId
-                    new_task_id = str(ObjectId())
-                    task_doc = {
-                        "_id": ObjectId(new_task_id),
-                        "name": task_name,
-                        "target": target_str,
-                        "status": "waiting",
-                        "policy_id": pol_id,
-                        "options": options,
-                        "start_time": datetime.now(timezone.utc)
-                    }
-                    utils.conn_db('task').insert_one(task_doc)
-                    celery.send_task("task.arl_task", args=[new_task_id])
-                    return {"status": "success", "task_id": new_task_id, "message": "Task submitted to queue"}
+                    options = get_options_by_policy_id(pol_id, TaskTag.TASK)
+                    if not options:
+                        return {"status": "error", "message": "Scan policy not found"}
+                    tasks = submit_task_task(target=target_str, name=task_name, options=options)
+                    if not tasks:
+                        return {"status": "error", "message": "No valid scan targets"}
+                    task_ids = [str(task['task_id']) for task in tasks]
+                    return {"status": "success", "task_id": task_ids[0], "task_ids": task_ids,
+                            "message": "Tasks submitted to queue"}
 
                 res = await asyncio.to_thread(_dispatch_task)
-                result, is_err = res, False
+                result, is_err = res, res.get('status') != 'success'
                 return result, is_err
 
             elif name == "stop_scan_task":
-                dispatch_allowed = self._dispatch_enabled or switches.get("stop_scan_task", False)
-                if not dispatch_allowed:
-                    result, is_err = {"status": "error", "message": "Task control is disabled on this server"}, True
-                    return result, is_err
                 task_id = str(args.get("task_id", "")).strip()
                 if not task_id or len(task_id) != 24:
                     result, is_err = {"status": "error", "message": "Invalid 24-character task_id"}, True
                     return result, is_err
 
                 def _stop_task():
-                    from bson import ObjectId
-                    utils.conn_db('task').update_one({"_id": ObjectId(task_id)}, {"$set": {"status": "stop"}})
-                    return {"status": "success", "task_id": task_id, "message": "Task stopped"}
+                    from app.routes.task import stop_task
+                    response = stop_task(task_id)
+                    return {"status": "success" if response.get('code') == 200 else "error",
+                            "task_id": task_id, "message": response.get('message', '')}
 
                 res = await asyncio.to_thread(_stop_task)
-                result, is_err = res, False
+                result, is_err = res, res.get('status') != 'success'
                 return result, is_err
 
             result, is_err = {"status": "error", "message": f"Tool '{name}' not found"}, True
+            return result, is_err
+        except MCPRequestError as e:
+            result, is_err = {"status": "denied", "message": str(e), "code": e.status}, True
             return result, is_err
         except Exception as e:
             logger.error(f"Error handling tool call {name}: {e}", exc_info=True)
@@ -490,7 +358,7 @@ class MCPServer:
             duration_ms = int((time.time() - start_time) * 1000)
             asyncio.create_task(self._record_audit_log(user_info, name, target, args, result, is_err, duration_ms))
 
-    async def handle_jsonrpc(self, req: dict, session: MCPSession) -> Optional[dict]:
+    async def handle_jsonrpc(self, req: dict, session: MCPSession, *, quota_checked=False) -> Optional[dict]:
         """处理遵循 JSON-RPC 2.0 规范的 MCP 核心协议报文"""
         req_id = req.get("id")
         method = req.get("method", "")
@@ -533,7 +401,7 @@ class MCPServer:
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "tools": self.get_supported_tools()
+                    "tools": await asyncio.to_thread(self.get_supported_tools, session.auth_user)
                 }
             }
 
@@ -541,7 +409,8 @@ class MCPServer:
         if method == "tools/call":
             tool_name = params.get("name", "")
             tool_args = params.get("arguments", {})
-            profile_data, is_err = await self.handle_tool_call(tool_name, tool_args, session.auth_user)
+            profile_data, is_err = await self.handle_tool_call(tool_name, tool_args, session.auth_user,
+                                                             quota_checked=quota_checked)
             compact_json_str = json.dumps(profile_data, ensure_ascii=False, separators=(",", ":"))
             return {
                 "jsonrpc": "2.0",
@@ -568,6 +437,18 @@ class MCPServer:
                 }
             }
         return None
+
+    async def _http_error(self, writer, status, message, retry_after=None):
+        reasons = {400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
+                   404: 'Not Found', 429: 'Too Many Requests', 503: 'Service Unavailable'}
+        body = json.dumps({'code': status, 'message': message}, ensure_ascii=False).encode()
+        retry = f'Retry-After: {retry_after}\r\n' if retry_after is not None else ''
+        writer.write((f'HTTP/1.1 {status} {reasons.get(status, "Error")}\r\n'
+                      f'Content-Type: application/json; charset=utf-8\r\n'
+                      f'Content-Length: {len(body)}\r\n{retry}Connection: close\r\n\r\n').encode() + body)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """处理 HTTP/1.1 原生长连接与请求路由"""
@@ -604,25 +485,26 @@ class MCPServer:
             path = parsed_url.path
             query_params = urllib.parse.parse_qs(parsed_url.query)
 
-            # 鉴权检查:
-            # 1. 尝试从 Header 或 Query 提取 token 并验证
             token = self._extract_token_from_request(headers, query_params)
-            auth_user = self.authenticate_token(token) if token else None
-
-            # 2. 若未携带显式 Token 且为 POST /message，支持基于激活状态的 Session ID 继承握手鉴权上下文
-            if not auth_user and method == "POST" and path in ("/message", "/mcp/message"):
-                sid = ""
-                if "sessionid" in query_params:
-                    sid = query_params["sessionid"][0]
-                elif "sessionId" in query_params:
-                    sid = query_params["sessionId"][0]
-                elif "x-session-id" in headers:
-                    sid = headers["x-session-id"]
-
-                if sid and sid in self.sessions:
-                    existing_session = self.sessions[sid]
-                    if not existing_session.is_closed and existing_session.auth_user:
-                        auth_user = existing_session.auth_user
+            sid = (query_params.get('sessionid') or query_params.get('sessionId')
+                   or [headers.get('x-session-id', '')])[0]
+            session = self.sessions.get(sid)
+            if method == 'POST' and path in ('/message', '/mcp/message'):
+                if not session or session.is_closed:
+                    await self._http_error(writer, 401, 'Invalid or expired MCP session')
+                    return
+                # A session is bound to its handshake credential. Never fall back
+                # from an explicitly wrong token to a cached privileged identity.
+                if token and not hmac.compare_digest(token.encode(), session.credential.encode()):
+                    await self._http_error(writer, 401, 'Credential does not match MCP session')
+                    return
+                auth_user = await asyncio.to_thread(self.authenticate_token, session.credential)
+                if not auth_user:
+                    session.close()
+                else:
+                    session.auth_user = auth_user
+            else:
+                auth_user = await asyncio.to_thread(self.authenticate_token, token)
 
             if not auth_user:
                 err_resp = json.dumps({"error": "Unauthorized", "message": "Invalid or missing token / session"}, ensure_ascii=False)
@@ -645,7 +527,7 @@ class MCPServer:
             # ==================== 路由 1: GET /sse 或 /mcp/sse (建立 SSE 长连接) ====================
             if method == "GET" and path in ("/sse", "/mcp/sse"):
                 session_id = secrets.token_urlsafe(24)
-                session = MCPSession(session_id, auth_user)
+                session = MCPSession(session_id, auth_user, credential=token)
                 self.sessions[session_id] = session
                 logger.info(f"SSE Client connected: session={session_id}, user={auth_user.get('username')}, peer={peer_name}")
 
@@ -678,6 +560,9 @@ class MCPServer:
                             writer.write(sse_block.encode("utf-8"))
                             await writer.drain()
                         except asyncio.TimeoutError:
+                            if not await asyncio.to_thread(self.authenticate_token, session.credential):
+                                session.close()
+                                break
                             writer.write(b": keepalive\r\n\r\n")
                             await writer.drain()
 
@@ -751,6 +636,27 @@ class MCPServer:
                     await writer.wait_closed()
                     return
 
+                if (not isinstance(req_json, dict) or not isinstance(req_json.get('params', {}), dict)
+                        or (req_json.get('method') == 'tools/call'
+                            and not isinstance(req_json.get('params', {}).get('arguments', {}), dict))):
+                    await self._http_error(writer, 400, 'Invalid JSON-RPC request')
+                    return
+                quota_checked = False
+                if req_json.get('method') == 'tools/call':
+                    tool_name = req_json.get('params', {}).get('name', '')
+                    try:
+                        policy = await asyncio.to_thread(load_mcp_policy, self._dispatch_enabled)
+                        authorize_tool(auth_user, tool_name, policy)
+                        await asyncio.to_thread(consume_mcp_quota, auth_user, policy)
+                        quota_checked = True
+                    except MCPRequestError as error:
+                        arguments = req_json.get('params', {}).get('arguments', {})
+                        target = str(arguments.get('target') or arguments.get('query') or arguments.get('task_id') or '')
+                        await self._record_audit_log(auth_user, tool_name, target, arguments,
+                            {'status': 'denied', 'message': str(error)}, True, 0)
+                        await self._http_error(writer, error.status, str(error), error.retry_after)
+                        return
+
                 session.touch()
                 # 立即向客户端返回 202 Accepted 确认投递
                 resp_ack = b"HTTP/1.1 202 Accepted\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 8\r\n\r\nAccepted"
@@ -761,7 +667,12 @@ class MCPServer:
 
                 # 异步处理 JSON-RPC 逻辑并将结果推入该 session 的下行队列
                 async def _dispatch_rpc():
-                    res = await self.handle_jsonrpc(req_json, session)
+                    try:
+                        res = await self.handle_jsonrpc(req_json, session, quota_checked=quota_checked)
+                    except Exception:
+                        logger.exception('MCP request processing failed')
+                        res = {'jsonrpc': '2.0', 'id': req_json.get('id'),
+                               'error': {'code': -32603, 'message': 'MCP request processing failed'}}
                     if res is not None:
                         await session.queue.put(res)
 

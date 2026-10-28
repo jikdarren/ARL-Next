@@ -66,6 +66,16 @@
                     {{ pageText('pages.mcpDedicatedKeyTag') }}
                   </a-tag>
                 </div>
+                <a-input-password
+                  v-if="selectedKeyId !== 'current_session'"
+                  v-model:value="keySecrets[selectedKeyId]"
+                  :placeholder="pageText('pages.mcpFullKeyPlaceholder')"
+                  autocomplete="off"
+                  style="max-width: 520px; margin-top: 8px;"
+                />
+                <div v-if="selectedKeyId !== 'current_session'" class="field-hint">
+                  {{ pageText('pages.mcpFullKeyHint') }}
+                </div>
               </div>
             </div>
 
@@ -680,6 +690,7 @@ import {
 } from '@ant-design/icons-vue';
 import request from '@/utils/request';
 import { copyText } from '@/utils/clipboard';
+import { resolveMcpCredential } from '@/utils/mcpCredentials';
 
 const { t } = useI18n({ useScope: 'global' });
 const pageText = t;
@@ -694,6 +705,7 @@ const isIpAccess = ref(/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(hostname) || hostn
 const mcpMode = ref(isIpAccess.value ? 'stdio' : 'sse');
 const showCertGuide = ref(false);
 const selectedKeyId = ref('current_session');
+const keySecrets = reactive({});
 const selectedClient = ref('cursor');
 const isDownloadingScript = ref(false);
 
@@ -816,16 +828,12 @@ const toolSwitchConfigs = [
 
 // 6. 计算配置片段
 const currentTokenValue = computed(() => {
-  if (selectedKeyId.value === 'current_session') {
-    return localStorage.getItem('token') || '<TOKEN>';
-  }
-  const matched = activeKeyOptions.value.find(k => k.id === selectedKeyId.value);
-  return matched ? matched.key_prefix : '<YOUR_MCP_KEY>';
+  return resolveMcpCredential(selectedKeyId.value, localStorage.getItem('token'), keySecrets);
 });
 
 const configSnippet = computed(() => {
   const host = `${window.location.protocol}//${window.location.host}`;
-  const token = currentTokenValue.value;
+  const token = currentTokenValue.value || '<YOUR_MCP_KEY>';
 
   if (mcpMode.value === 'sse') {
     const sseConfig = {
@@ -933,6 +941,7 @@ const handleCreateKeySubmit = async () => {
     if (res && res.data && res.data.code === 200) {
       createKeyModalVisible.value = false;
       createdKeyPlaintext.value = res.data.data.raw_key;
+      keySecrets[res.data.data.id] = res.data.data.raw_key;
       keySuccessModalVisible.value = true;
       await fetchKeys();
       if (res.data.data.id) {
@@ -1176,6 +1185,10 @@ onBeforeRouteLeave(() => {
 });
 
 const handleCopySnippet = async () => {
+  if (!currentTokenValue.value) {
+    message.warning(pageText('pages.mcpFullKeyRequired'));
+    return;
+  }
   const ok = await copyText(configSnippet.value);
   if (ok) message.success(pageText('pages.mcpConfigurationCopiedToClipboard'));
 };
@@ -1186,12 +1199,18 @@ const handleCopyCreatedKey = async () => {
 };
 
 const handleDownloadScript = async () => {
+  if (!currentTokenValue.value) {
+    message.warning(pageText('pages.mcpFullKeyRequired'));
+    return;
+  }
   isDownloadingScript.value = true;
   try {
     const host = `${window.location.protocol}//${window.location.host}`;
     const token = currentTokenValue.value;
-    const res = await fetch(`/api/mcp/export_server?host=${encodeURIComponent(host)}&raw_key=${encodeURIComponent(token)}`, {
-      headers: { Token: localStorage.getItem('token') || '' }
+    const res = await fetch('/api/mcp/export_server', {
+      method: 'POST',
+      headers: { Token: localStorage.getItem('token') || '', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ host, ...(selectedKeyId.value === 'current_session' ? {} : { raw_key: token }) })
     });
     if (res.ok) {
       const blob = await res.blob();
